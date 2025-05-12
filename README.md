@@ -1,4 +1,4 @@
 # Kiến trúc mô hình
 
 
-![img.png](img.png)
+![ra_genks.png](ra_genks.png)
