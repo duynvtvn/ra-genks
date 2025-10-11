@@ -734,33 +734,6 @@ class EnhancedGenKSWithRAG:
 
         return response
 
-    # def calculate_perplexity(self, input_text, target_text):
-    #     inputs = self.tokenizer(
-    #         input_text,
-    #         return_tensors="pt",
-    #         truncation=True,
-    #         max_length=1024
-    #     ).to(self.device)
-
-    #     labels = self.tokenizer(
-    #         target_text,
-    #         return_tensors="pt",
-    #         truncation=True,
-    #         max_length=512
-    #     ).to(self.device).input_ids
-
-    #     with torch.no_grad():
-    #         outputs = self.model(
-    #             input_ids=inputs.input_ids,
-    #             attention_mask=inputs.attention_mask,
-    #             labels=labels
-    #         )
-    #         loss = outputs.loss
-
-    #     ppl = math.exp(loss.item())
-
-    #     return ppl
-
     def calculate_perplexity(self, input_text, target_text):
         inputs = self.tokenizer(
             input_text,
@@ -916,7 +889,6 @@ def calculate_unigram_f1(prediction, ground_truth):
     prediction_tokens = prediction_normalized.split()
     ground_truth_tokens = ground_truth_normalized.split()
 
-    # Phần còn lại giữ nguyên logic cũ
     if len(prediction_tokens) == 0 and len(ground_truth_tokens) == 0:
         return 1.0
     if len(prediction_tokens) == 0 or len(ground_truth_tokens) == 0:
@@ -1019,38 +991,6 @@ def calculate_knowledge_f1(prediction, gold_knowledge):
     f1 = (2 * precision * recall) / (precision + recall)
 
     return f1
-
-# def calculate_knowledge_f1(prediction, ground_truth):
-#     """
-#     Tính Knowledge F1 - tập trung vào việc sử dụng tri thức
-#
-#     Args:
-#         prediction: Văn bản dự đoán (string)
-#         ground_truth: Văn bản tham chiếu (string)
-#
-#     Returns:
-#         f1_score: Điểm F1 (float)
-#     """
-#     prediction_tokens = set(prediction.lower().split())
-#     ground_truth_tokens = set(ground_truth.lower().split())
-#
-#     if len(prediction_tokens) == 0 and len(ground_truth_tokens) == 0:
-#         return 1.0
-#     if len(prediction_tokens) == 0 or len(ground_truth_tokens) == 0:
-#         return 0.0
-#
-#     common = prediction_tokens & ground_truth_tokens
-#     num_same = len(common)
-#
-#     if num_same == 0:
-#         return 0.0
-#
-#     precision = num_same / len(prediction_tokens)
-#     recall = num_same / len(ground_truth_tokens)
-#     f1 = (2 * precision * recall) / (precision + recall)
-#
-#     return f1
-
 
 def evaluate_enhanced_genks(
         model,
