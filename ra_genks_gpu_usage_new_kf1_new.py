@@ -330,9 +330,9 @@ class ImprovedMultiSpanGENKSData(Dataset):
                     knowledge_parts.append(f"<k{i + 1}>[{title}] {sentence}</k{i + 1}>")
             knowledge_parts.append("</knowledge>")
             knowledge_text = "\n".join(knowledge_parts)
-            input_sequence = f"{input_sequence}\n\n{knowledge_text}\n\nPhản hồi:"
+            input_sequence = f"{input_sequence}\n\n{knowledge_text}\n\nResponse:"
         else:
-            input_sequence = f"{input_sequence}\n\nPhản hồi:"
+            input_sequence = f"{input_sequence}\n\nResponse:"
 
         if 'response' in example:
             target = example['response']
@@ -708,7 +708,7 @@ class EnhancedGenKSWithRAG:
         knowledge_parts.append("</knowledge>")
         knowledge_text = "\n".join(knowledge_parts)
 
-        input_text = f"{context_text}\n\n{knowledge_text}\n\nPhản hồi:"
+        input_text = f"{context_text}\n\n{knowledge_text}\n\nResponse:"
 
         return input_text
 
@@ -954,7 +954,7 @@ def calculate_knowledge_f1(prediction, gold_knowledge):
     if not gold_knowledge or gold_knowledge == "no_passages_used":
         return 0.0
 
-    # Normalize cả prediction và gold knowledge theo cách của bài báo
+    # Normalize cả prediction và gold knowledge
     prediction_normalized = normalize_answer(prediction)
     gold_knowledge_normalized = normalize_answer(gold_knowledge)
 
@@ -988,9 +988,9 @@ def calculate_knowledge_f1(prediction, gold_knowledge):
     recall = num_same / sum(knowledge_counter.values())
 
     # F1 score - harmonic mean của precision và recall
-    f1 = (2 * precision * recall) / (precision + recall)
+    kf1 = (2 * precision * recall) / (precision + recall)
 
-    return f1
+    return kf1
 
 def evaluate_enhanced_genks(
         model,
