@@ -1995,16 +1995,16 @@ def train_ragenks(
                 model.model.train()
 
             # Periodic checkpoint
-            if global_step % save_every_n_steps == 0 and accelerator.is_main_process:
-                save_path = os.path.join(output_dir, f'checkpoint_{global_step}')
-                os.makedirs(save_path, exist_ok=True)
-
-                unwrapped_model = accelerator.unwrap_model(model.model)
-                model.model = unwrapped_model
-                model.save(save_path)
-                model.model = accelerator.prepare(unwrapped_model)
-
-                logger.info(f"💾 Saved checkpoint at step {global_step}")
+            # if global_step % save_every_n_steps == 0 and accelerator.is_main_process:
+            #     save_path = os.path.join(output_dir, f'checkpoint_{global_step}')
+            #     os.makedirs(save_path, exist_ok=True)
+            #
+            #     unwrapped_model = accelerator.unwrap_model(model.model)
+            #     model.model = unwrapped_model
+            #     model.save(save_path)
+            #     model.model = accelerator.prepare(unwrapped_model)
+            #
+            #     logger.info(f"💾 Saved checkpoint at step {global_step}")
 
         # End of epoch evaluation
         avg_train_loss = train_loss / train_steps
