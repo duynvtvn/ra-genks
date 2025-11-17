@@ -1101,7 +1101,7 @@ class EnhancedRAGenKS:
             verbose: bool = True
     ) -> Dict[str, Any]:
         """
-        ⭐ MAIN PIPELINE FUNCTION
+        MAIN PIPELINE FUNCTION
         Xử lý query qua đầy đủ 4 giai đoạn của RA-GenKS.
         Đây là function quan trọng nhất cho inference và end-to-end evaluation.
 
@@ -2128,8 +2128,8 @@ def main():
         model=model,
         eval_data=test_data,
         output_dir=os.path.join(config['output_dir'], 'evaluation'),
-        num_samples=None,  # Evaluate on all samples
-        run_ablation=True,
+        num_samples=None,
+        run_ablation=False,
         verbose=False
     )
 
