@@ -3,73 +3,251 @@ import os
 import json
 import re
 import torch
+import torch.nn as nn
 import numpy as np
-import faiss
 from tqdm import tqdm
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, Counter
 from torch.utils.data import Dataset, DataLoader
 from transformers import (
     AutoTokenizer,
     AutoModelForSeq2SeqLM,
     DPRContextEncoder,
     DPRQuestionEncoder,
-    get_constant_schedule_with_warmup,
     get_linear_schedule_with_warmup
 )
 from torch.optim import AdamW
 from accelerate import Accelerator
-from sentence_transformers import SentenceTransformer, util
+from sentence_transformers import SentenceTransformer, util, CrossEncoder
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import ndcg_score
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from rouge import Rouge
 import math
+import time
+from datetime import datetime, timedelta
+import psutil
+from typing import Dict, List, Tuple, Optional, Any, Union
 
-# Thiết lập logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Setup logging với format chi tiết
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(name)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger(__name__)
+
+# Regular expressions để normalize text
+RE_ART = re.compile(r'\b(a|an|the)\b')
+RE_PUNC = re.compile(r'[!"#$%&()*+,-./:;<=>?@\[\]\\^`{|}~_\']')
+
+
+# ================================================================================
+# PHẦN 1: UTILITY FUNCTIONS VÀ HELPER CLASSES
+# ================================================================================
+
+def normalize_answer(s: str) -> str:
+    """
+    Chuẩn hóa text để so sánh công bằng giữa prediction và ground truth.
+    Loại bỏ articles, dấu câu, và chuẩn hóa khoảng trắng.
+    """
+
+    def remove_articles(text):
+        return RE_ART.sub(' ', text)
+
+    def white_space_fix(text):
+        return ' '.join(text.split())
+
+    def remove_punc(text):
+        return RE_PUNC.sub(' ', text)
+
+    def lower(text):
+        return text.lower()
+
+    # Áp dụng theo thứ tự để chuẩn hóa hoàn toàn
+    return white_space_fix(remove_articles(remove_punc(lower(s))))
+
+
+def calculate_unigram_f1(prediction: str, ground_truth: str) -> float:
+    """
+    Tính Unigram F1 score - đo lường overlap về từ vựng giữa prediction và ground truth.
+    Đây là metric quan trọng để đánh giá chất lượng response.
+    """
+    # Normalize cả hai texts trước khi so sánh
+    prediction_normalized = normalize_answer(prediction)
+    ground_truth_normalized = normalize_answer(ground_truth)
+
+    prediction_tokens = prediction_normalized.split()
+    ground_truth_tokens = ground_truth_normalized.split()
+
+    # Edge cases: một hoặc cả hai đều rỗng
+    if len(prediction_tokens) == 0 and len(ground_truth_tokens) == 0:
+        return 1.0
+    if len(prediction_tokens) == 0 or len(ground_truth_tokens) == 0:
+        return 0.0
+
+    # Đếm tần suất từ để tính chính xác
+    pred_counter = Counter(prediction_tokens)
+    truth_counter = Counter(ground_truth_tokens)
+
+    # Tìm từ chung và đếm số lần xuất hiện
+    common_tokens = 0
+    for token in pred_counter:
+        if token in truth_counter:
+            common_tokens += min(pred_counter[token], truth_counter[token])
+
+    # Tính precision, recall và F1
+    precision = common_tokens / sum(pred_counter.values()) if sum(pred_counter.values()) > 0 else 0
+    recall = common_tokens / sum(truth_counter.values()) if sum(truth_counter.values()) > 0 else 0
+
+    if precision + recall == 0:
+        return 0.0
+
+    f1 = 2 * precision * recall / (precision + recall)
+    return f1
+
+
+def calculate_knowledge_f1(prediction: str, gold_knowledge: str) -> float:
+    """
+    Tính Knowledge F1 - metric quan trọng để phát hiện hallucination.
+    So sánh response với gold knowledge để xem model có dùng đúng tri thức không.
+
+    KF1 cao + F1 thấp: Model dùng đúng knowledge nhưng diễn đạt khác
+    KF1 thấp + F1 cao: Model có thể đang hallucinate (tự tạo thông tin)
+    """
+    if not gold_knowledge or gold_knowledge == "no_passages_used":
+        return 0.0
+
+    # Normalize và tokenize
+    prediction_normalized = normalize_answer(prediction)
+    gold_knowledge_normalized = normalize_answer(gold_knowledge)
+
+    prediction_tokens = prediction_normalized.split()
+    knowledge_tokens = gold_knowledge_normalized.split()
+
+    if len(prediction_tokens) == 0 and len(knowledge_tokens) == 0:
+        return 1.0
+    if len(prediction_tokens) == 0 or len(knowledge_tokens) == 0:
+        return 0.0
+
+    # Tính overlap với Counter để handle duplicates
+    pred_counter = Counter(prediction_tokens)
+    knowledge_counter = Counter(knowledge_tokens)
+
+    common = pred_counter & knowledge_counter
+    num_same = sum(common.values())
+
+    if num_same == 0:
+        return 0.0
+
+    # Precision: Bao nhiêu % response từ gold knowledge
+    precision = num_same / sum(pred_counter.values())
+
+    # Recall: Bao nhiêu % gold knowledge được mention
+    recall = num_same / sum(knowledge_counter.values())
+
+    # F1 score
+    kf1 = (2 * precision * recall) / (precision + recall)
+    return kf1
+
+
+class GPUMonitor:
+    """
+    Monitor GPU và system resources trong quá trình training/evaluation.
+    Giúp track memory usage và phát hiện memory leaks.
+    """
+
+    def __init__(self, device='cuda'):
+        self.device = device
+        self.monitoring_data = []
+        self.peak_memory = 0
+        self.start_time = None
+        self.gpu_available = torch.cuda.is_available()
+
+        if self.gpu_available:
+            self.gpu_count = torch.cuda.device_count()
+            self.gpu_name = torch.cuda.get_device_name(0)
+            logger.info(f"GPU Monitor initialized: {self.gpu_count} GPU(s) - {self.gpu_name}")
+        else:
+            logger.warning("No GPU found, monitoring CPU/RAM only")
+
+    def get_gpu_stats(self) -> Dict:
+        """Thu thập thông tin GPU và system hiện tại"""
+        stats = {
+            'timestamp': datetime.now().isoformat(),
+            'cpu_percent': psutil.cpu_percent(interval=1),
+            'ram_used_gb': psutil.virtual_memory().used / (1024 ** 3),
+            'ram_percent': psutil.virtual_memory().percent
+        }
+
+        if self.gpu_available:
+            # GPU memory stats
+            allocated = torch.cuda.memory_allocated(self.device) / (1024 ** 3)
+            reserved = torch.cuda.memory_reserved(self.device) / (1024 ** 3)
+            total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+
+            stats['gpu_memory_allocated_gb'] = allocated
+            stats['gpu_memory_reserved_gb'] = reserved
+            stats['gpu_memory_total_gb'] = total
+            stats['gpu_memory_free_gb'] = total - allocated
+            stats['gpu_memory_percent'] = (allocated / total) * 100
+
+            # Update peak memory
+            if allocated > self.peak_memory:
+                self.peak_memory = allocated
+            stats['peak_memory_gb'] = self.peak_memory
+
+        return stats
+
+    def start_monitoring(self):
+        """Bắt đầu monitoring session"""
+        self.start_time = time.time()
+        initial_stats = self.get_gpu_stats()
+        initial_stats['event'] = 'start_monitoring'
+        self.monitoring_data.append(initial_stats)
+        logger.info(f"Started GPU/System monitoring at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    def log_stats(self, event_name="checkpoint", extra_info=None):
+        """Log stats tại một thời điểm cụ thể"""
+        stats = self.get_gpu_stats()
+        stats['event'] = event_name
+
+        if self.start_time:
+            elapsed = time.time() - self.start_time
+            stats['elapsed_time_seconds'] = elapsed
+            stats['elapsed_time_formatted'] = str(timedelta(seconds=int(elapsed)))
+
+        if extra_info:
+            stats.update(extra_info)
+
+        self.monitoring_data.append(stats)
+
+        if self.gpu_available:
+            logger.info(
+                f"[{event_name}] GPU Memory: {stats['gpu_memory_allocated_gb']:.2f}/{stats['gpu_memory_total_gb']:.2f} GB "
+                f"({stats['gpu_memory_percent']:.1f}%) | Peak: {self.peak_memory:.2f} GB"
+            )
 
 
 class HyperlinkProcessor:
     """
-    Lớp xử lý và quản lý hyperlink giữa đối thoại và tri thức
-
-    Hyperlink là cơ chế quan trọng trong GenKS để nắm bắt mối liên kết giữa các lượt đối thoại
-    với các đoạn tri thức, giúp mô hình hiểu được cấu trúc diễn ngôn và duy trì sự liên tục
-    trong việc sử dụng tri thức qua các lượt đối thoại.
+    Xử lý hyperlinks giữa dialogue và knowledge.
     """
 
     def __init__(self):
-        """Khởi tạo bộ xử lý hyperlink"""
-        # Lưu trữ mapping giữa turn_id và tri thức (knowledge_id, title)
         self.dialogue_knowledge_mapping = {}
 
-    def add_hyperlink(self, turn_id, knowledge_id, title):
-        """
-        Thêm hyperlink giữa lượt đối thoại và đoạn tri thức
-
-        Args:
-            turn_id: ID của lượt đối thoại
-            knowledge_id: ID của đoạn tri thức (ví dụ: 'k1')
-            title: Tiêu đề của đoạn tri thức
-        """
+    def add_hyperlink(self, turn_id: int, knowledge_id: str, title: str):
+        """Thêm mapping giữa dialogue turn và knowledge"""
         self.dialogue_knowledge_mapping[turn_id] = (knowledge_id, title)
 
-    def get_hyperlinks_for_context(self, dialogue_history):
-        """
-        Lấy lịch sử đối thoại đã được bổ sung hyperlink
-
-        Args:
-            dialogue_history: Danh sách các phát ngôn trong lịch sử đối thoại
-
-        Returns:
-            Danh sách các phát ngôn đã được bổ sung hyperlink
-        """
+    def get_hyperlinks_for_context(self, dialogue_history: List[str]) -> List[str]:
+        """Tạo hyperlinked version của dialogue history"""
         hyperlinked_history = []
 
         for i, utterance in enumerate(dialogue_history):
             if i in self.dialogue_knowledge_mapping:
                 knowledge_id, title = self.dialogue_knowledge_mapping[i]
-                # Thêm hyperlink vào đầu phát ngôn, theo định dạng [title]<knowledge_id>
+                # Format: [title]<knowledge_id> utterance
                 hyperlinked_utterance = f"[{title}]<{knowledge_id}> {utterance}"
                 hyperlinked_history.append(hyperlinked_utterance)
             else:
@@ -78,101 +256,82 @@ class HyperlinkProcessor:
         return hyperlinked_history
 
 
+# ================================================================================
+# PHẦN 2: KNOWLEDGE SELECTOR
+# ================================================================================
+
 class GenerativeKnowledgeSelector:
     """
-    Bộ chọn tri thức dựa trên phương pháp tạo sinh (generative approach)
-
-    Thay vì phân loại độc lập từng đoạn tri thức, lớp này sử dụng mô hình sequence-to-sequence
-    để tạo sinh định danh của các đoạn tri thức liên quan nhất, giúp nắm bắt mối quan hệ
-    giữa các đoạn tri thức và cải thiện khả năng hiểu ngữ cảnh.
+    Bộ chọn tri thức sử dụng phương pháp generative.
+    Model sinh ra identifiers (<k1>, <k2>...) để chọn knowledge phù hợp.
     """
 
     def __init__(self, model, tokenizer, max_knowledge_candidates=20, device='cuda'):
-        """
-        Khởi tạo bộ chọn tri thức dựa trên phương pháp tạo sinh
-
-        Args:
-            model: Mô hình sequence-to-sequence
-            tokenizer: Tokenizer tương ứng với mô hình
-            max_knowledge_candidates: Số lượng ứng viên tri thức tối đa
-            device: Thiết bị tính toán ('cuda' hoặc 'cpu')
-        """
         self.model = model
         self.tokenizer = tokenizer
         self.max_knowledge_candidates = max_knowledge_candidates
         self.device = device
 
-    def prepare_input_for_generation(self, query, dialogue_history, knowledge_candidates, hyperlinked_history=None):
+    def prepare_input_for_generation(
+            self,
+            query: str,
+            dialogue_history: List[str],
+            knowledge_candidates: List[Tuple[str, str, float]],
+            hyperlinked_history: Optional[List[str]] = None
+    ) -> str:
         """
-        Chuẩn bị đầu vào cho mô hình tạo sinh để chọn tri thức
-
-        Args:
-            query: Câu truy vấn hiện tại
-            dialogue_history: Lịch sử đối thoại
-            knowledge_candidates: Danh sách các đoạn tri thức ứng viên
-            hyperlinked_history: Lịch sử đối thoại đã bổ sung hyperlink
-
-        Returns:
-            Chuỗi đầu vào đã định dạng
+        Chuẩn bị input cho model selection.
+        Format: Context + Query + Knowledge Candidates → Selection
         """
-        # Xây dựng ngữ cảnh đối thoại
         context_parts = []
-
-        # Sử dụng lịch sử đã bổ sung hyperlink nếu có
         history_to_use = hyperlinked_history if hyperlinked_history else dialogue_history
 
+        # Format dialogue history với speaker labels
         if history_to_use:
             for i, utterance in enumerate(history_to_use):
                 speaker = "User1: " if i % 2 == 0 else "User2: "
                 context_parts.append(f"{speaker}{utterance}")
 
-        # Thêm truy vấn hiện tại
+        # Add current query
         current_speaker = "User1: " if len(context_parts) % 2 == 0 else "User2: "
         context_parts.append(f"{current_speaker}{query}")
-
         context_text = "\n".join(context_parts)
 
-        # Xây dựng phần tri thức
-        knowledge_parts = ["Thông tin tham khảo:"]
-
-        # Giới hạn số lượng ứng viên tri thức để tránh vượt quá độ dài tối đa
+        # Format knowledge candidates với identifiers
+        knowledge_parts = ["Reference Information:"]
         candidates_to_use = knowledge_candidates[:self.max_knowledge_candidates]
 
         for i, (title, text, _) in enumerate(candidates_to_use):
-            # Gán định danh cho từng đoạn tri thức
             knowledge_parts.append(f"<k{i + 1}> [{title}] {text}")
 
         knowledge_text = "\n".join(knowledge_parts)
 
-        # Kết hợp ngữ cảnh và tri thức
-        # Phần prompt đặc biệt "Chọn tri thức phù hợp nhất:" sẽ hướng dẫn mô hình sinh ra định danh
-        input_text = f"{context_text}\n\n{knowledge_text}\n\nChọn tri thức phù hợp nhất:"
+        # Final input format
+        input_text = f"{context_text}\n\n{knowledge_text}\n\nKnowledge Selection:"
 
         return input_text
 
-    def select_knowledge(self, query, knowledge_candidates, dialogue_history=None, hyperlinked_history=None, top_k=3):
+    def select_knowledge(
+            self,
+            query: str,
+            knowledge_candidates: List[Tuple[str, str, float]],
+            dialogue_history: Optional[List[str]] = None,
+            hyperlinked_history: Optional[List[str]] = None,
+            top_k: int = 3
+    ) -> List[Tuple[str, str, float]]:
         """
-        Chọn top-k tri thức phù hợp nhất bằng cách tạo sinh định danh
-
-        Args:
-            query: Câu truy vấn hiện tại
-            knowledge_candidates: Danh sách các đoạn tri thức ứng viên [(title, text, score)]
-            dialogue_history: Lịch sử đối thoại
-            hyperlinked_history: Lịch sử đối thoại đã bổ sung hyperlink
-            top_k: Số lượng đoạn tri thức cần chọn
-
-        Returns:
-            Danh sách các đoạn tri thức được chọn [(title, text, score)]
+        Chọn top-k knowledge pieces phù hợp nhất.
+        Model sinh ra sequence của identifiers (<k1>, <k2>...) để chọn.
         """
         if not knowledge_candidates:
             return []
 
-        # Chuẩn bị đầu vào
+        # Prepare input
         input_text = self.prepare_input_for_generation(
-            query, dialogue_history, knowledge_candidates, hyperlinked_history
+            query, dialogue_history or [], knowledge_candidates, hyperlinked_history
         )
 
-        # Mã hóa đầu vào
+        # Tokenize và generate
         inputs = self.tokenizer(
             input_text,
             return_tensors="pt",
@@ -180,663 +339,576 @@ class GenerativeKnowledgeSelector:
             max_length=1024
         ).to(self.device)
 
-        # Sinh định danh tri thức
         with torch.no_grad():
             outputs = self.model.generate(
                 input_ids=inputs.input_ids,
                 attention_mask=inputs.attention_mask,
-                max_length=20,  # Sinh ngắn gọn chỉ các định danh
+                max_length=20,  # Chỉ cần generate identifiers
                 num_beams=4,
                 no_repeat_ngram_size=2,
                 early_stopping=True
             )
 
-        # Giải mã đầu ra để lấy các định danh
         generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=False)
-        logger.info(f"Generated identifier text: {generated_text}")
+        logger.debug(f"Generated selection: {generated_text}")
 
-        # Trích xuất các định danh được sinh ra (<k1>, <k2>, v.v.)
+        # Parse identifiers từ generated text
         selected_knowledge = []
         pattern = r'<k(\d+)>'
         matches = re.findall(pattern, generated_text)
 
-        # Chuyển định danh thành chỉ số (id) và lấy tri thức tương ứng
         for match in matches:
-            idx = int(match) - 1  # Chuyển từ 1-indexed sang 0-indexed
+            idx = int(match) - 1
             if idx < len(knowledge_candidates):
-                title, text, score = knowledge_candidates[idx]
-                selected_knowledge.append((title, text, score))
+                selected_knowledge.append(knowledge_candidates[idx])
                 if len(selected_knowledge) >= top_k:
                     break
 
-        # Nếu không tìm thấy đủ định danh, bổ sung bằng cách lấy top-k theo điểm số
+        # Nếu chưa đủ, fill với highest scored candidates
         if len(selected_knowledge) < top_k:
-            # Sắp xếp tri thức còn lại theo điểm số và bổ sung
             remaining_candidates = [
                 c for c in knowledge_candidates
                 if all(c[1] != k[1] for k in selected_knowledge)
             ]
             remaining_candidates.sort(key=lambda x: x[2], reverse=True)
-
-            # Thêm vào danh sách đã chọn
-            selected_knowledge.extend(
-                remaining_candidates[:top_k - len(selected_knowledge)]
-            )
+            selected_knowledge.extend(remaining_candidates[:top_k - len(selected_knowledge)])
 
         return selected_knowledge
 
 
-class ImprovedMultiSpanGENKSData(Dataset):
+# ================================================================================
+# PHẦN 3: DATASET CLASS
+# ================================================================================
+
+class RAGenKSDataset(Dataset):
     """
-    Lớp xử lý dữ liệu cho mô hình GenKS cải tiến với hỗ trợ hyperlink và chọn nhiều đoạn tri thức
-    """
-
-    def __init__(self, data, tokenizer, context_len=256, knowledge_len=64, max_length=1024,
-                 test=False, top_k_knowledge=3, add_hyperlink=True):
-        """
-        Khởi tạo bộ dữ liệu
-
-        Args:
-            data: Dữ liệu đầu vào
-            tokenizer: Tokenizer để xử lý văn bản
-            context_len: Độ dài tối đa của ngữ cảnh
-            knowledge_len: Độ dài tối đa của mỗi đoạn tri thức
-            max_length: Độ dài tối đa của chuỗi đầu vào
-            test: Chế độ kiểm thử
-            top_k_knowledge: Số lượng đoạn tri thức tối đa sử dụng
-            add_hyperlink: Có thêm hyperlink hay không
-        """
-        super().__init__()
-        self.data = data
-        self.tokenizer = tokenizer
-        self.context_len = context_len
-        self.knowledge_len = knowledge_len
-        self.max_length = max_length
-        self.test = test
-        self.top_k_knowledge = top_k_knowledge
-        self.add_hyperlink = add_hyperlink
-
-        # Hyperlink processor để quản lý và xây dựng hyperlink
-        self.hyperlink_processor = HyperlinkProcessor()
-
-        # Thêm đánh dấu đặc biệt cho tri thức
-        special_tokens = ['<knowledge>', '</knowledge>']
-        for i in range(1, top_k_knowledge + 1):
-            special_tokens.extend([f'<k{i}>', f'</k{i}>'])
-
-        self.tokenizer.add_tokens(special_tokens)
-
-    def __getitem__(self, index):
-        """
-        Lấy mẫu dữ liệu tại vị trí index
-
-        Args:
-            index: Vị trí của mẫu dữ liệu
-
-        Returns:
-            Tuple (input_ids, labels)
-        """
-        example = self.data[index]
-
-        # =============================
-        # Xử lý ngữ cảnh đối thoại
-        # =============================
-        context_parts = []
-
-        # Thêm thông tin chủ đề nếu có
-        if 'chosen_topic' in example:
-            context_parts.append(f"Chủ đề: {example['chosen_topic']}")
-
-        # Xử lý lịch sử đối thoại
-        dialogue_history = []
-        hyperlinked_history = []
-
-        # Mapping roles
-        role = {'0_Wizard': 'User1', '1_Apprentice': 'User2', '0_Apprentice': 'User2',
-                '1_Wizard': 'User1', 0: 'User1', 1: 'User2', 'user1': 'User1', 'user2': 'User2'}
-
-        if 'context' in example:
-            for i, turn in enumerate(example['context']):
-                speaker = role.get(turn.get('speaker', ''), turn.get('speaker', ''))
-                text = turn.get('text', '')
-                dialogue_history.append(text)
-
-                # Thêm hyperlink nếu cần và có tri thức được sử dụng
-                if self.add_hyperlink and 'knowledge_used' in turn:
-                    knowledge_id = f"k{i + 1}"
-                    knowledge_title = turn.get('knowledge_title', 'unknown')
-                    self.hyperlink_processor.add_hyperlink(i, knowledge_id, knowledge_title)
-
-            # Lấy lịch sử với hyperlink
-            if self.add_hyperlink:
-                hyperlinked_history = self.hyperlink_processor.get_hyperlinks_for_context(dialogue_history)
-
-        # Sử dụng lịch sử với hyperlink nếu có
-        history_to_use = hyperlinked_history if hyperlinked_history else dialogue_history
-
-        # Thêm lịch sử đối thoại vào ngữ cảnh
-        for i, utterance in enumerate(history_to_use):
-            speaker = role.get(i % 2, f"User{(i % 2) + 1}")
-            context_parts.append(f"{speaker}: {utterance}")
-
-        # Kết hợp thành ngữ cảnh hoàn chỉnh
-        context_text = "\n".join(context_parts)
-
-        # =============================
-        # Xử lý tri thức
-        # =============================
-        # Thu thập các đoạn tri thức
-        knowledge_items = []
-
-        # Lấy tri thức từ ví dụ
-        if 'knowledge' in example:
-            for title, sentences in example['knowledge'].items():
-                for sentence in sentences:
-                    knowledge_items.append((title, sentence, 1.0))  # Mặc định điểm số 1.0
-
-        # Ưu tiên tri thức được sử dụng nếu có
-        checked_knowledge = []
-        if 'title' in example and example.get('title') != 'no_passages_used' and 'checked_sentence' in example:
-            checked_knowledge.append((example['title'], example['checked_sentence'], 1.0))
-            # Loại bỏ tri thức đã kiểm tra khỏi danh sách để tránh trùng lặp
-            knowledge_items = [k for k in knowledge_items if k[1] != example['checked_sentence']]
-
-        # Kết hợp tri thức đã kiểm tra và các tri thức khác
-        selected_knowledge = checked_knowledge.copy()
-
-        # Nếu cần thêm tri thức để đủ top_k
-        if len(selected_knowledge) < self.top_k_knowledge and knowledge_items:
-            # Sắp xếp ngẫu nhiên trong quá trình huấn luyện để tăng tính đa dạng
-            if not self.test:
-                np.random.shuffle(knowledge_items)
-
-            # Thêm tri thức vào danh sách đã chọn
-            selected_knowledge.extend(
-                knowledge_items[:self.top_k_knowledge - len(selected_knowledge)]
-            )
-
-        # =============================
-        # Xây dựng chuỗi đầu vào
-        # =============================
-        input_sequence = context_text
-
-        # Thêm tri thức đã chọn
-        if selected_knowledge:
-            knowledge_parts = ["<knowledge>Thông tin tham khảo:"]
-
-            for i, (title, sentence, _) in enumerate(selected_knowledge):
-                if i < self.top_k_knowledge:
-                    # Sử dụng thẻ đánh dấu tri thức đặc biệt
-                    knowledge_parts.append(f"<k{i + 1}>[{title}] {sentence}</k{i + 1}>")
-
-            knowledge_parts.append("</knowledge>")
-            knowledge_text = "\n".join(knowledge_parts)
-
-            # Kết hợp ngữ cảnh và tri thức
-            input_sequence = f"{input_sequence}\n\n{knowledge_text}\n\nPhản hồi:"
-        else:
-            input_sequence = f"{input_sequence}\n\nPhản hồi:"
-
-        # =============================
-        # Xây dựng đầu ra (nhãn)
-        # =============================
-        if 'response' in example:
-            target = example['response']
-        elif 'labels' in example and example['labels']:
-            target = example['labels'][0]
-        else:
-            target = ""
-
-        # Mã hóa đầu vào và đầu ra
-        input_ids = self.tokenizer.encode(
-            input_sequence,
-            truncation=True,
-            max_length=self.max_length,
-            add_special_tokens=True
-        )
-
-        labels = self.tokenizer.encode(
-            target,
-            truncation=True,
-            max_length=self.context_len,
-            add_special_tokens=True
-        )
-
-        return torch.tensor(input_ids), torch.tensor(labels)
-
-    def __len__(self):
-        """Trả về số lượng mẫu dữ liệu"""
-        return len(self.data)
-
-    def collate_fn(self, data):
-        """
-        Hàm gộp batch cho DataLoader
-
-        Args:
-            data: Danh sách các mẫu
-
-        Returns:
-            Dict batch đã gộp
-        """
-        from torch.nn.utils.rnn import pad_sequence
-        padding_value = self.tokenizer.pad_token_id
-        input_ids, labels = zip(*data)
-
-        # Padding các chuỗi trong batch
-        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=padding_value)
-        labels = pad_sequence(labels, batch_first=True, padding_value=-100)
-
-        return {
-            'input_ids': input_ids,
-            'attention_mask': input_ids.ne(padding_value),
-            'labels': labels,
-        }
-
-
-class EnhancedGenKSWithRAG:
-    """
-    Mô hình GenKS cải tiến kết hợp với RAG, hỗ trợ:
-    1. Phương pháp tạo sinh để chọn tri thức (theo GenKS)
-    2. Cơ chế hyperlink để theo dõi mối liên hệ giữa đối thoại và tri thức
-    3. Quy trình RAG đa giai đoạn để cải thiện chất lượng tri thức
+    Dataset cho training RA-GenKS với teacher forcing.
+    Trong training, sử dụng gold knowledge thay vì retrieved knowledge.
     """
 
     def __init__(
             self,
-            model_name='facebook/bart-base',
-            retriever_model_name='facebook/dpr-ctx_encoder-single-nq-base',
-            query_encoder_name='facebook/dpr-question_encoder-single-nq-base',
-            ranker_model_name='cross-encoder/ms-marco-MiniLM-L-6-v2',
-            embed_dim=768,
-            top_k_retrieval=100,
-            top_k_rerank=20,
-            top_k_knowledge=3,
-            retrieval_method='bm25',
-            use_generative_selection=True,
-            device='cuda',
-            cache_dir=None
+            data: List[Dict],
+            tokenizer,
+            max_context_length: int = 512,
+            max_knowledge_length: int = 256,
+            max_response_length: int = 128,
+            test: bool = False,
+            top_k_knowledge: int = 3,
+            add_hyperlink: bool = True
+    ):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.max_context_length = max_context_length
+        self.max_knowledge_length = max_knowledge_length
+        self.max_response_length = max_response_length
+        self.test = test
+        self.top_k_knowledge = top_k_knowledge
+        self.add_hyperlink = add_hyperlink
+        self.hyperlink_processor = HyperlinkProcessor()
+
+        # Add special tokens nếu chưa có
+        special_tokens = ['<knowledge>', '</knowledge>']
+        for i in range(1, top_k_knowledge + 1):
+            special_tokens.extend([f'<k{i}>', f'</k{i}>'])
+
+        tokens_to_add = [t for t in special_tokens if t not in tokenizer.get_vocab()]
+        if tokens_to_add:
+            tokenizer.add_tokens(tokens_to_add)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        """
+        Chuẩn bị một training example.
+        Trong training, dùng gold knowledge (teacher forcing).
+        """
+        example = self.data[index]
+
+        # Build context từ dialogue history
+        context_parts = []
+
+        # Add topic nếu có
+        if 'chosen_topic' in example and example['chosen_topic']:
+            context_parts.append(f"Topic: {example['chosen_topic']}")
+
+        # Process dialogue history
+        dialogue_history = []
+        if 'context' in example:
+            for turn in example['context']:
+                text = turn.get('text', '')
+                dialogue_history.append(text)
+
+        # Format dialogue với speaker labels
+        for i, utterance in enumerate(dialogue_history):
+            speaker = "User1: " if i % 2 == 0 else "User2: "
+            context_parts.append(f"{speaker}{utterance}")
+
+        # Add current query
+        query = example.get('query', '') or example.get('text', '')
+        if query:
+            current_speaker = "User1: " if len(dialogue_history) % 2 == 0 else "User2: "
+            context_parts.append(f"{current_speaker}{query}")
+
+        context_text = "\n".join(context_parts)
+
+        # Prepare knowledge (trong training dùng gold knowledge)
+        selected_knowledge = []
+
+        # Gold knowledge từ dataset
+        gold_knowledge = example.get('checked_sentence', '')
+        gold_title = example.get('title', '')
+
+        if gold_knowledge and gold_knowledge != 'no_passages_used':
+            selected_knowledge.append((gold_title, gold_knowledge, 1.0))
+
+        # Thêm additional knowledge nếu cần (để đủ top_k)
+        if 'knowledge' in example:
+            for title, sentences in example['knowledge'].items():
+                for sentence in sentences:
+                    if sentence != gold_knowledge:  # Tránh duplicate
+                        selected_knowledge.append((title, sentence, 0.5))
+                        if len(selected_knowledge) >= self.top_k_knowledge:
+                            break
+                if len(selected_knowledge) >= self.top_k_knowledge:
+                    break
+
+        # Format input với knowledge
+        if selected_knowledge:
+            knowledge_parts = ["<knowledge>Reference Information:"]
+            for i, (title, text, _) in enumerate(selected_knowledge[:self.top_k_knowledge]):
+                knowledge_parts.append(f"<k{i + 1}>[{title}] {text}</k{i + 1}>")
+            knowledge_parts.append("</knowledge>")
+            knowledge_text = "\n".join(knowledge_parts)
+            input_sequence = f"{context_text}\n\n{knowledge_text}\n\nResponse:"
+        else:
+            input_sequence = f"{context_text}\n\nResponse:"
+
+        # Target response
+        target_response = example.get('response', '') or (
+            example.get('labels', [''])[0] if 'labels' in example else ''
+        )
+
+        # Tokenize input
+        inputs = self.tokenizer(
+            input_sequence,
+            truncation=True,
+            max_length=self.max_context_length + self.max_knowledge_length,
+            padding='max_length',
+            return_tensors='pt'
+        )
+
+        # Tokenize target
+        with self.tokenizer.as_target_tokenizer():
+            labels = self.tokenizer(
+                target_response,
+                truncation=True,
+                max_length=self.max_response_length,
+                padding='max_length',
+                return_tensors='pt'
+            ).input_ids
+
+        # Replace padding token id với -100 cho loss computation
+        labels[labels == self.tokenizer.pad_token_id] = -100
+
+        return {
+            'input_ids': inputs.input_ids.squeeze(),
+            'attention_mask': inputs.attention_mask.squeeze(),
+            'labels': labels.squeeze()
+        }
+
+
+# ================================================================================
+# PHẦN 4: MAIN MODEL - ENHANCED RA-GENKS
+# ================================================================================
+
+class EnhancedRAGenKS:
+    """
+    Mô hình RA-GenKS hoàn chỉnh với 4 giai đoạn pipeline.
+
+    Kiến trúc:
+    1. Retrieval: BM25/DPR/Sentence-BERT
+    2. Reranking: Cross-Encoder
+    3. Knowledge Selection: Generative/Similarity-based
+    4. Response Generation: BART/T5
+    """
+
+    def __init__(
+            self,
+            model_name: str = 'facebook/bart-base',
+            retriever_model_name: str = 'facebook/dpr-ctx_encoder-single-nq-base',
+            query_encoder_name: str = 'facebook/dpr-question_encoder-single-nq-base',
+            ranker_model_name: str = 'cross-encoder/ms-marco-MiniLM-L-6-v2',
+            embed_dim: int = 768,
+            top_k_retrieval: int = 100,
+            top_k_rerank: int = 20,
+            top_k_knowledge: int = 3,
+            retrieval_method: str = 'bm25',
+            use_generative_selection: bool = True,
+            device: str = 'cuda',
+            cache_dir: Optional[str] = None
     ):
         """
-        Khởi tạo mô hình GenKS cải tiến
+        Khởi tạo mô hình với các components.
 
         Args:
-            model_name: Tên mô hình ngôn ngữ chính
-            retriever_model_name: Tên mô hình bộ truy xuất
-            query_encoder_name: Tên mô hình mã hóa truy vấn
-            ranker_model_name: Tên mô hình xếp hạng
-            embed_dim: Chiều của embedding
-            top_k_retrieval: Số lượng tài liệu truy xuất
-            top_k_rerank: Số lượng tài liệu sau khi xếp hạng lại
-            top_k_knowledge: Số lượng đoạn tri thức được chọn
-            retrieval_method: Phương pháp truy xuất ('bm25' hoặc 'dpr')
-            use_generative_selection: Có sử dụng phương pháp tạo sinh để chọn tri thức hay không
-            device: Thiết bị tính toán
-            cache_dir: Thư mục cache
+            model_name: Pretrained model cho generation
+            retrieval_method: 'bm25', 'dpr', hoặc 'sentence_bert'
+            use_generative_selection: True để dùng generative selection
+            top_k_*: Số lượng candidates ở mỗi stage
         """
-        self.device = device
+        self.device = device if torch.cuda.is_available() else 'cpu'
         self.top_k_retrieval = top_k_retrieval
         self.top_k_rerank = top_k_rerank
         self.top_k_knowledge = top_k_knowledge
         self.retrieval_method = retrieval_method.lower()
         self.use_generative_selection = use_generative_selection
 
-        # Thiết lập tokenizer và mô hình chính
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        logger.info(f"Initializing Enhanced RA-GenKS on {self.device}")
+        logger.info(
+            f"Configuration: retrieval={retrieval_method}, selection={'generative' if use_generative_selection else 'similarity'}")
 
-        # Thêm tokens đặc biệt cho tri thức
+        # Initialize generation model
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name, cache_dir=cache_dir).to(self.device)
+
+        # Add special tokens for knowledge marking
         special_tokens = ['<knowledge>', '</knowledge>']
         for i in range(1, top_k_knowledge + 1):
             special_tokens.extend([f'<k{i}>', f'</k{i}>'])
 
-        self.tokenizer.add_tokens(special_tokens)
+        num_added = self.tokenizer.add_tokens(special_tokens)
+        if num_added > 0:
+            self.model.resize_token_embeddings(len(self.tokenizer))
+            logger.info(f"Added {num_added} special tokens to vocabulary")
 
-        # Tải mô hình chính
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
-        self.model.resize_token_embeddings(len(self.tokenizer))
+        # Initialize retrieval components
+        self.corpus = []
+        self.corpus_embeddings = None
+        self.faiss_index = None
 
-        # Thiết lập bộ truy xuất và bộ xếp hạng
-        self._initialize_retrievers(retriever_model_name, query_encoder_name, embed_dim)
-        self._initialize_ranker(ranker_model_name)
+        if retrieval_method == 'dpr':
+            # Dense Passage Retrieval
+            self.ctx_encoder = DPRContextEncoder.from_pretrained(
+                retriever_model_name, cache_dir=cache_dir
+            ).to(self.device)
+            self.query_encoder = DPRQuestionEncoder.from_pretrained(
+                query_encoder_name, cache_dir=cache_dir
+            ).to(self.device)
+            logger.info("Initialized DPR encoders")
 
-        # Thiết lập bộ chọn tri thức dựa trên phương pháp tạo sinh
+        elif retrieval_method == 'sentence_bert':
+            # Sentence-BERT for retrieval
+            self.encoder = SentenceTransformer('all-MiniLM-L6-v2', cache_folder=cache_dir)
+            logger.info("Initialized Sentence-BERT encoder")
+
+        else:  # BM25
+            from rank_bm25 import BM25Okapi
+            self.bm25 = None  # Will be initialized with corpus
+            logger.info("Will use BM25 for retrieval")
+
+        # Initialize reranker
+        try:
+            self.ranker = CrossEncoder(ranker_model_name)
+            logger.info(f"Initialized CrossEncoder reranker: {ranker_model_name}")
+        except Exception as e:
+            self.ranker = None
+            logger.warning(f"CrossEncoder not available: {e}. Will use retrieval scores for ranking.")
+
+        # Initialize knowledge selector
         self.generative_selector = GenerativeKnowledgeSelector(
             model=self.model,
             tokenizer=self.tokenizer,
-            max_knowledge_candidates=20,
-            device=device
+            device=self.device
         )
 
-        # Thiết lập bộ xử lý hyperlink
+        # Initialize hyperlink processor
         self.hyperlink_processor = HyperlinkProcessor()
 
-        # Bộ nhớ cache cho các tài liệu đã truy xuất
-        self.doc_cache = {}
-        self.corpus = None
-        self.id_to_doc = None
+        logger.info("Enhanced RA-GenKS initialization complete")
 
-    def _initialize_retrievers(self, retriever_model_name, query_encoder_name, embed_dim):
+    def build_corpus_index(self, corpus_data: List[Dict], cache_path: Optional[str] = None):
         """
-        Khởi tạo các bộ truy xuất (DPR, BM25, SBERT, TF-IDF)
+        Xây dựng index cho retrieval từ corpus data.
+        Corpus có thể từ training data hoặc external knowledge base.
+        """
+        logger.info(f"Building corpus index from {len(corpus_data)} documents...")
 
-        Args:
-            retriever_model_name: Tên mô hình bộ truy xuất
-            query_encoder_name: Tên mô hình mã hóa truy vấn
-            embed_dim: Chiều của embedding
-        """
-        # Luôn khởi tạo BM25 vì nó nhẹ và hiệu quả
-        try:
+        self.corpus = []
+
+        # Extract tất cả knowledge pieces từ data
+        for item in tqdm(corpus_data, desc="Processing corpus"):
+            if 'knowledge' in item:
+                for title, sentences in item['knowledge'].items():
+                    for sentence in sentences:
+                        if len(sentence.split()) >= 5:  # Filter quá ngắn
+                            self.corpus.append({
+                                'id': len(self.corpus),
+                                'title': title,
+                                'text': sentence
+                            })
+
+        logger.info(f"Corpus contains {len(self.corpus)} knowledge pieces")
+
+        # Build index dựa trên retrieval method
+        if self.retrieval_method == 'bm25':
+            # BM25 index
             from rank_bm25 import BM25Okapi
-            self.bm25_class = BM25Okapi
-            self.bm25 = None  # Sẽ được khởi tạo trong build_corpus_index
-            self.tokenized_corpus = None
-            logger.info("Đã khởi tạo BM25 thành công")
-        except ImportError:
-            logger.warning("Không thể nhập rank_bm25. Cài đặt bằng cách 'pip install rank-bm25'")
-            self.bm25_class = None
 
-        # Nếu sử dụng DPR, khởi tạo mô hình DPR
-        if self.retrieval_method == 'dpr':
-            try:
-                self.ctx_encoder = DPRContextEncoder.from_pretrained(retriever_model_name).to(self.device)
-                self.query_encoder = DPRQuestionEncoder.from_pretrained(query_encoder_name).to(self.device)
-                self.dpr_tokenizer = AutoTokenizer.from_pretrained(retriever_model_name)
-                self.query_tokenizer = AutoTokenizer.from_pretrained(query_encoder_name)
-                logger.info("Đã khởi tạo bộ truy xuất DPR thành công")
-            except Exception as e:
-                logger.warning(f"Không thể khởi tạo DPR: {str(e)}, sẽ sử dụng SentenceTransformer thay thế")
-                try:
-                    self.encoder = SentenceTransformer('sentence-transformers/all-mpnet-base-v2').to(self.device)
-                    self.index = faiss.IndexFlatIP(embed_dim)
-                    logger.info("Đã khởi tạo SentenceTransformer thành công")
-                except Exception as e:
-                    logger.warning(f"Không thể khởi tạo SentenceTransformer: {str(e)}, sẽ sử dụng TF-IDF")
-                    self.retrieval_method = 'tfidf'
-
-        # Luôn khởi tạo TF-IDF làm phương pháp dự phòng
-        self.tfidf_vectorizer = TfidfVectorizer(stop_words='english')
-
-    def _initialize_ranker(self, ranker_model_name):
-        """
-        Khởi tạo bộ xếp hạng lại (re-ranker)
-
-        Args:
-            ranker_model_name: Tên mô hình cross-encoder để xếp hạng
-        """
-        try:
-            from sentence_transformers import CrossEncoder
-            self.ranker = CrossEncoder(ranker_model_name)
-            logger.info(f"Đã khởi tạo CrossEncoder thành công: {ranker_model_name}")
-        except Exception as e:
-            logger.warning(f"Không thể khởi tạo CrossEncoder: {str(e)}, sẽ sử dụng phương pháp xếp hạng đơn giản")
-            self.ranker = None
-
-    def build_corpus_index(self, corpus, cache_path=None):
-        """
-        Xây dựng chỉ mục (index) cho corpus để truy xuất nhanh
-
-        Args:
-            corpus: Danh sách tài liệu [(id, text, title)]
-            cache_path: Đường dẫn để lưu/tải embeddings từ cache
-        """
-        self.corpus = corpus
-        self.id_to_doc = {item[0]: (item[1], item[2]) for item in corpus}
-        texts = [doc[1] for doc in corpus]
-
-        # Xây dựng chỉ mục BM25
-        if hasattr(self, 'bm25_class') and self.bm25_class is not None:
-            logger.info("Đang xây dựng chỉ mục BM25...")
             # Tokenize corpus cho BM25
-            self.tokenized_corpus = [text.lower().split() for text in texts]
-            self.bm25 = self.bm25_class(self.tokenized_corpus)
-            logger.info("Đã xây dựng chỉ mục BM25 thành công")
+            tokenized_corpus = [doc['text'].lower().split() for doc in self.corpus]
+            self.bm25 = BM25Okapi(tokenized_corpus)
+            logger.info("BM25 index built successfully")
 
-        # Nếu sử dụng DPR, xây dựng chỉ mục DPR
-        if self.retrieval_method == 'dpr':
-            # Tải embeddings từ cache nếu có
+        elif self.retrieval_method in ['dpr', 'sentence_bert']:
+            # Dense retrieval với FAISS
+            import faiss
+
+            # Check cache để tránh re-compute embeddings
             if cache_path and os.path.exists(cache_path):
-                logger.info(f"Đang tải embeddings từ cache: {cache_path}")
+                logger.info(f"Loading embeddings from cache: {cache_path}")
                 self.corpus_embeddings = torch.load(cache_path)
-                # Xây dựng chỉ mục FAISS
-                self.index = faiss.IndexFlatIP(self.corpus_embeddings.size(1))
-                self.index.add(self.corpus_embeddings.cpu().numpy())
-                logger.info("Đã tải và xây dựng chỉ mục từ cache thành công")
-                return
+            else:
+                logger.info("Computing embeddings for corpus...")
+                texts = [doc['text'] for doc in self.corpus]
 
-            # Xây dựng embeddings mới nếu không có cache
-            if hasattr(self, 'ctx_encoder') and hasattr(self, 'dpr_tokenizer'):
-                logger.info("Đang tạo embeddings cho corpus với DPR...")
-                self.corpus_embeddings = []
+                if self.retrieval_method == 'dpr':
+                    # Encode với DPR context encoder
+                    batch_size = 32
+                    embeddings = []
 
-                batch_size = 32
-                for i in tqdm(range(0, len(texts), batch_size)):
-                    batch_texts = texts[i:i + batch_size]
-                    with torch.no_grad():
-                        inputs = self.dpr_tokenizer(
+                    for i in tqdm(range(0, len(texts), batch_size), desc="Encoding with DPR"):
+                        batch_texts = texts[i:i + batch_size]
+                        inputs = self.ctx_encoder.ctx_encoder.tokenizer(
                             batch_texts,
-                            return_tensors="pt",
                             padding=True,
                             truncation=True,
-                            max_length=512
+                            max_length=512,
+                            return_tensors='pt'
                         ).to(self.device)
-                        embeddings = self.ctx_encoder(**inputs).pooler_output
-                    self.corpus_embeddings.append(embeddings.cpu())
 
-                self.corpus_embeddings = torch.cat(self.corpus_embeddings, dim=0)
+                        with torch.no_grad():
+                            batch_embeddings = self.ctx_encoder(**inputs).pooler_output
+                        embeddings.append(batch_embeddings.cpu())
 
-                # Lưu embeddings vào cache nếu có đường dẫn
+                    self.corpus_embeddings = torch.cat(embeddings, dim=0).numpy()
+
+                else:  # sentence_bert
+                    self.corpus_embeddings = self.encoder.encode(
+                        texts,
+                        convert_to_tensor=False,
+                        show_progress_bar=True,
+                        batch_size=32
+                    )
+
+                # Save embeddings to cache
                 if cache_path:
-                    logger.info(f"Đang lưu embeddings vào cache: {cache_path}")
                     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
                     torch.save(self.corpus_embeddings, cache_path)
+                    logger.info(f"Saved embeddings to cache: {cache_path}")
 
-                # Xây dựng chỉ mục FAISS
-                self.index = faiss.IndexFlatIP(self.corpus_embeddings.shape[1])
-                self.index.add(self.corpus_embeddings.cpu().numpy())
+            # Build FAISS index
+            dim = self.corpus_embeddings.shape[1]
+            self.faiss_index = faiss.IndexFlatIP(dim)  # Inner product for similarity
 
-            elif hasattr(self, 'encoder'):
-                # Sử dụng SentenceTransformer
-                logger.info("Đang tạo embeddings cho corpus với SentenceTransformer...")
-                self.corpus_embeddings = self.encoder.encode(texts, show_progress_bar=True, convert_to_tensor=True)
+            # Normalize vectors cho cosine similarity
+            faiss.normalize_L2(self.corpus_embeddings)
+            self.faiss_index.add(self.corpus_embeddings)
 
-                # Xây dựng chỉ mục FAISS
-                self.index = faiss.IndexFlatIP(self.corpus_embeddings.shape[1])
-                self.index.add(self.corpus_embeddings.cpu().numpy())
+            logger.info(f"FAISS index built with {self.faiss_index.ntotal} vectors")
 
-        # Xây dựng ma trận TF-IDF dự phòng
-        logger.info("Đang tạo ma trận TF-IDF...")
-        self.tfidf_matrix = self.tfidf_vectorizer.fit_transform(texts)
-
-    def retrieve_documents(self, query, dialogue_history=None, top_k=None):
+    def retrieve_documents(
+            self,
+            query: str,
+            dialogue_history: Optional[List[str]] = None,
+            top_k: Optional[int] = None
+    ) -> List[Tuple[int, str, str, float]]:
         """
-        Giai đoạn 1: Truy xuất tài liệu sơ bộ
-
-        Args:
-            query: Câu truy vấn
-            dialogue_history: Lịch sử đối thoại
-            top_k: Số lượng tài liệu cần truy xuất
+        Giai đoạn 1: RETRIEVAL
+        Truy xuất top-k documents từ corpus dựa trên query và context.
 
         Returns:
-            Danh sách tài liệu truy xuất [(id, text, title, score)]
+            List of (doc_id, text, title, score)
         """
         if top_k is None:
             top_k = self.top_k_retrieval
 
-        # Kết hợp truy vấn với lịch sử đối thoại nếu có
+        # Combine query với recent dialogue context
         if dialogue_history:
-            last_n_turns = dialogue_history[-3:]  # Lấy 3 lượt cuối
-            combined_query = " ".join(last_n_turns) + " " + query
+            # Lấy 3 turns gần nhất cho context
+            recent_context = " ".join(dialogue_history[-3:])
+            combined_query = f"{recent_context} {query}"
         else:
             combined_query = query
 
-        # Kiểm tra bộ nhớ cache
-        cache_key = combined_query[:100]  # Sử dụng phần đầu của truy vấn làm khóa
-        if cache_key in self.doc_cache:
-            logger.info(f"Sử dụng kết quả từ bộ nhớ cache cho truy vấn: {cache_key}...")
-            return self.doc_cache[cache_key]
+        retrieved_docs = []
 
-        # Sử dụng BM25 nếu được chọn hoặc phương pháp khác không khả dụng
-        if (self.retrieval_method == 'bm25' or self.retrieval_method not in ['dpr', 'tfidf']) and hasattr(self,
-                                                                                                          'bm25') and self.bm25 is not None:
-            logger.info("Đang truy xuất với BM25...")
-            # Tokenize truy vấn tương tự corpus
+        if self.retrieval_method == 'bm25':
+            # BM25 retrieval
+            if self.bm25 is None:
+                logger.error("BM25 index not built. Call build_corpus_index first.")
+                return []
+
+            # Tokenize query cho BM25
             tokenized_query = combined_query.lower().split()
             scores = self.bm25.get_scores(tokenized_query)
-            indices = np.argsort(-scores)[:top_k]
 
-            # Chuyển indices thành tài liệu
-            retrieved_docs = []
-            for idx in indices:
-                doc_id = self.corpus[idx][0]
-                doc_text = self.corpus[idx][1]
-                doc_title = self.corpus[idx][2]
-                retrieved_docs.append((doc_id, doc_text, doc_title, float(scores[idx])))
+            # Get top-k documents
+            top_indices = np.argsort(scores)[::-1][:top_k]
 
-        # Sử dụng DPR nếu được chọn và khả dụng
-        elif self.retrieval_method == 'dpr' and hasattr(self, 'query_encoder'):
-            logger.info("Đang truy xuất với DPR...")
-            with torch.no_grad():
-                inputs = self.query_tokenizer(combined_query, return_tensors="pt").to(self.device)
-                query_embedding = self.query_encoder(**inputs).pooler_output.cpu().numpy()
+            for idx in top_indices:
+                if idx < len(self.corpus):
+                    doc = self.corpus[idx]
+                    retrieved_docs.append((
+                        doc['id'],
+                        doc['text'],
+                        doc['title'],
+                        float(scores[idx])
+                    ))
 
-            # Tìm kiếm với FAISS
-            scores, indices = self.index.search(query_embedding, top_k)
+        elif self.retrieval_method in ['dpr', 'sentence_bert']:
+            # Dense retrieval với FAISS
+            import faiss
 
-            # Chuyển indices thành tài liệu
-            retrieved_docs = []
-            for idx, score in zip(indices.flatten(), scores.flatten()):
-                doc_id = self.corpus[idx][0]
-                doc_text = self.corpus[idx][1]
-                doc_title = self.corpus[idx][2]
-                retrieved_docs.append((doc_id, doc_text, doc_title, float(score)))
+            if self.faiss_index is None:
+                logger.error("FAISS index not built. Call build_corpus_index first.")
+                return []
 
-        # Sử dụng SentenceTransformer nếu DPR không khả dụng
-        elif hasattr(self, 'encoder'):
-            logger.info("Đang truy xuất với SentenceTransformer...")
-            query_embedding = self.encoder.encode(combined_query, convert_to_tensor=True)
+            # Encode query
+            if self.retrieval_method == 'dpr':
+                # Use DPR query encoder
+                inputs = self.query_encoder.question_encoder.tokenizer(
+                    combined_query,
+                    return_tensors='pt',
+                    truncation=True,
+                    max_length=512
+                ).to(self.device)
 
-            # Tìm kiếm với FAISS
-            scores, indices = self.index.search(query_embedding.cpu().numpy().reshape(1, -1), top_k)
+                with torch.no_grad():
+                    query_embedding = self.query_encoder(**inputs).pooler_output
+                query_embedding = query_embedding.cpu().numpy()
 
-            # Chuyển indices thành tài liệu
-            retrieved_docs = []
-            for idx, score in zip(indices.flatten(), scores.flatten()):
-                doc_id = self.corpus[idx][0]
-                doc_text = self.corpus[idx][1]
-                doc_title = self.corpus[idx][2]
-                retrieved_docs.append((doc_id, doc_text, doc_title, float(score)))
+            else:  # sentence_bert
+                query_embedding = self.encoder.encode(
+                    [combined_query],
+                    convert_to_tensor=False
+                )
 
-        # Fallback sang TF-IDF nếu các phương pháp khác không khả dụng
-        else:
-            logger.info("Đang truy xuất với TF-IDF...")
-            query_vec = self.tfidf_vectorizer.transform([combined_query])
-            scores = (self.tfidf_matrix @ query_vec.T).toarray().flatten()
-            indices = np.argsort(-scores)[:top_k]
+            # Normalize và search
+            faiss.normalize_L2(query_embedding)
+            scores, indices = self.faiss_index.search(query_embedding, top_k)
 
-            # Chuyển indices thành tài liệu
-            retrieved_docs = []
-            for idx in indices:
-                doc_id = self.corpus[idx][0]
-                doc_text = self.corpus[idx][1]
-                doc_title = self.corpus[idx][2]
-                retrieved_docs.append((doc_id, doc_text, doc_title, float(scores[idx])))
+            # Convert results
+            for idx, score in zip(indices[0], scores[0]):
+                if 0 <= idx < len(self.corpus):
+                    doc = self.corpus[idx]
+                    retrieved_docs.append((
+                        doc['id'],
+                        doc['text'],
+                        doc['title'],
+                        float(score)
+                    ))
 
-        # Lưu vào cache
-        self.doc_cache[cache_key] = retrieved_docs
-
+        logger.debug(f"Retrieved {len(retrieved_docs)} documents")
         return retrieved_docs
 
-    def rerank_documents(self, query, docs, dialogue_history=None, top_k=None):
+    def rerank_documents(
+            self,
+            query: str,
+            docs: List[Tuple[int, str, str, float]],
+            dialogue_history: Optional[List[str]] = None,
+            top_k: Optional[int] = None
+    ) -> List[Tuple[int, str, str, float]]:
         """
-        Giai đoạn 2: Xếp hạng lại tài liệu
-
-        Args:
-            query: Câu truy vấn
-            docs: Danh sách tài liệu đã truy xuất
-            dialogue_history: Lịch sử đối thoại
-            top_k: Số lượng tài liệu cần trả về
+        Giai đoạn 2: RERANKING
+        Xếp hạng lại documents với Cross-Encoder để tìm relevant nhất.
 
         Returns:
-            Danh sách tài liệu đã xếp hạng lại [(id, text, title, score)]
+            Reranked list of (doc_id, text, title, score)
         """
         if top_k is None:
             top_k = self.top_k_rerank
 
-        # Kết hợp truy vấn với lịch sử đối thoại nếu có
+        if not docs:
+            return []
+
+        # Combine query với context cho reranking
         if dialogue_history:
-            last_n_turns = dialogue_history[-3:]  # Lấy 3 lượt cuối
-            combined_query = " ".join(last_n_turns) + " " + query
+            recent_context = " ".join(dialogue_history[-3:])
+            combined_query = f"{recent_context} {query}"
         else:
             combined_query = query
 
-        # Sử dụng cross-encoder nếu có
         if self.ranker:
-            logger.info("Đang xếp hạng lại tài liệu với CrossEncoder...")
-            pairs = [(combined_query, doc[1]) for doc in docs]
-            scores = self.ranker.predict(pairs)
+            # Use Cross-Encoder để rerank
+            logger.debug(f"Reranking {len(docs)} documents with CrossEncoder")
 
-            # Xếp hạng lại dựa trên điểm mới
-            reranked_docs = [
-                (docs[i][0], docs[i][1], docs[i][2], float(scores[i]))
-                for i in range(len(docs))
-            ]
-            reranked_docs = sorted(reranked_docs, key=lambda x: x[3], reverse=True)[:top_k]
+            # Prepare pairs cho Cross-Encoder
+            pairs = [(combined_query, doc[1]) for doc in docs]
+
+            # Get scores từ Cross-Encoder
+            try:
+                ce_scores = self.ranker.predict(pairs)
+
+                # Combine Cross-Encoder scores với retrieval scores
+                # Weight: 70% Cross-Encoder, 30% retrieval
+                reranked_docs = []
+                for i, doc in enumerate(docs):
+                    combined_score = 0.7 * float(ce_scores[i]) + 0.3 * doc[3]
+                    reranked_docs.append((doc[0], doc[1], doc[2], combined_score))
+
+                # Sort by combined score
+                reranked_docs = sorted(reranked_docs, key=lambda x: x[3], reverse=True)[:top_k]
+
+            except Exception as e:
+                logger.warning(f"Cross-Encoder reranking failed: {e}. Using retrieval scores.")
+                reranked_docs = sorted(docs, key=lambda x: x[3], reverse=True)[:top_k]
         else:
-            # Nếu không có ranker, giữ nguyên thứ tự từ bước truy xuất
-            logger.info("Không có CrossEncoder, sử dụng điểm truy xuất gốc để xếp hạng...")
+            # Fallback: use retrieval scores
+            logger.debug("No Cross-Encoder available, using retrieval scores for ranking")
             reranked_docs = sorted(docs, key=lambda x: x[3], reverse=True)[:top_k]
 
+        logger.debug(f"Reranked to top {len(reranked_docs)} documents")
         return reranked_docs
 
-    def extract_sentences_from_docs(self, docs):
+    def select_knowledge_generatively(
+            self,
+            query: str,
+            reranked_docs: List[Tuple[int, str, str, float]],
+            dialogue_history: Optional[List[str]] = None,
+            hyperlinked_history: Optional[List[str]] = None
+    ) -> List[Tuple[str, str, float]]:
         """
-        Trích xuất các câu từ tài liệu
-
-        Args:
-            docs: Danh sách tài liệu
+        Giai đoạn 3a: KNOWLEDGE SELECTION (Generative)
+        Sử dụng model để sinh identifiers chọn knowledge pieces.
 
         Returns:
-            Danh sách các câu với tiêu đề và điểm số [(title, sentence, score)]
+            List of (title, text, score)
         """
-        all_sentences = []
+        # Extract sentences từ documents
+        knowledge_candidates = []
 
-        # Phân chia tài liệu thành các câu
-        for doc_id, doc_text, doc_title, doc_score in docs:
-            try:
-                import nltk
-                nltk.download('punkt', quiet=True)
-                sentences = nltk.sent_tokenize(doc_text)
-            except:
-                # Fallback nếu không thể sử dụng nltk
-                sentences = [doc_text]
+        for doc_id, doc_text, doc_title, doc_score in reranked_docs:
+            # Simple sentence splitting (có thể dùng NLTK cho tốt hơn)
+            sentences = doc_text.split('. ')
 
-            # Thêm từng câu với tiêu đề và điểm số
             for sentence in sentences:
-                if len(sentence.split()) >= 3:  # Bỏ qua câu quá ngắn
-                    all_sentences.append((doc_title, sentence, doc_score))
-
-        return all_sentences
-
-    def select_knowledge_generatively(self, query, reranked_docs, dialogue_history=None, hyperlinked_history=None):
-        """
-        Giai đoạn 3a: Chọn tri thức bằng phương pháp tạo sinh (GenKS)
-
-        Args:
-            query: Câu truy vấn
-            reranked_docs: Danh sách tài liệu đã xếp hạng lại
-            dialogue_history: Lịch sử đối thoại
-            hyperlinked_history: Lịch sử đối thoại đã bổ sung hyperlink
-
-        Returns:
-            Danh sách tri thức được chọn [(title, text, score)]
-        """
-        # Trích xuất các câu từ tài liệu
-        knowledge_candidates = self.extract_sentences_from_docs(reranked_docs)
+                sentence = sentence.strip()
+                if len(sentence.split()) >= 5:  # Filter sentences quá ngắn
+                    knowledge_candidates.append((doc_title, sentence, doc_score))
 
         if not knowledge_candidates:
+            logger.warning("No knowledge candidates found for selection")
             return []
 
-        # Sử dụng bộ chọn tri thức tạo sinh
-        selected_knowledge = self.generative_selector.select_knowledge(
+        logger.debug(f"Selecting from {len(knowledge_candidates)} knowledge candidates")
+
+        # Use generative selector
+        selected = self.generative_selector.select_knowledge(
             query=query,
             knowledge_candidates=knowledge_candidates,
             dialogue_history=dialogue_history,
@@ -844,122 +916,119 @@ class EnhancedGenKSWithRAG:
             top_k=self.top_k_knowledge
         )
 
-        return selected_knowledge
+        return selected
 
-    def select_knowledge_by_similarity(self, query, reranked_docs, dialogue_history=None):
+    def select_knowledge_by_similarity(
+            self,
+            query: str,
+            reranked_docs: List[Tuple[int, str, str, float]],
+            dialogue_history: Optional[List[str]] = None
+    ) -> List[Tuple[str, str, float]]:
         """
-        Giai đoạn 3b: Chọn tri thức dựa trên độ tương đồng
-
-        Args:
-            query: Câu truy vấn
-            reranked_docs: Danh sách tài liệu đã xếp hạng lại
-            dialogue_history: Lịch sử đối thoại
+        Giai đoạn 3b: KNOWLEDGE SELECTION (Similarity-based)
+        Chọn knowledge dựa trên similarity với query và context.
 
         Returns:
-            Danh sách tri thức được chọn [(title, text, score)]
+            List of (title, text, score)
         """
-        # Trích xuất các câu từ tài liệu
-        all_sentences = self.extract_sentences_from_docs(reranked_docs)
+        # Extract sentences
+        all_sentences = []
+
+        for doc_id, doc_text, doc_title, doc_score in reranked_docs:
+            sentences = doc_text.split('. ')
+
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if len(sentence.split()) >= 5:
+                    all_sentences.append((doc_title, sentence, doc_score))
 
         if not all_sentences:
+            logger.warning("No sentences found for selection")
             return []
 
-        # Kết hợp truy vấn với lịch sử đối thoại nếu có
+        # Combine query với context
         if dialogue_history:
-            last_n_turns = dialogue_history[-3:]  # Lấy 3 lượt cuối
-            combined_query = " ".join(last_n_turns) + " " + query
+            recent_context = " ".join(dialogue_history[-3:])
+            combined_query = f"{recent_context} {query}"
         else:
             combined_query = query
 
-        # Tính toán điểm tương đồng nếu có SentenceTransformer
-        if hasattr(self, 'encoder'):
-            try:
-                # Mã hóa truy vấn và các câu
-                query_embedding = self.encoder.encode(combined_query, convert_to_tensor=True)
-                sentence_texts = [sent[1] for sent in all_sentences]
-                sentence_embeddings = self.encoder.encode(sentence_texts, convert_to_tensor=True)
+        # Calculate similarity và select top-k
+        if hasattr(self, 'encoder'):  # Sentence-BERT available
+            logger.debug("Using Sentence-BERT for similarity-based selection")
 
-                # Tính độ tương đồng cosine
-                similarities = util.pytorch_cos_sim(query_embedding, sentence_embeddings)[0]
+            # Encode query và sentences
+            query_embedding = self.encoder.encode(combined_query, convert_to_tensor=True)
+            sentence_texts = [sent[1] for sent in all_sentences]
+            sentence_embeddings = self.encoder.encode(sentence_texts, convert_to_tensor=True)
 
-                # Lấy top-k câu có độ tương đồng cao nhất
-                top_indices = similarities.argsort(descending=True)[:self.top_k_knowledge].tolist()
+            # Calculate cosine similarities
+            similarities = util.pytorch_cos_sim(query_embedding, sentence_embeddings)[0]
 
-                # Lấy các câu tương ứng
-                selected_knowledge = [all_sentences[idx] for idx in top_indices]
+            # Get top-k
+            top_indices = similarities.argsort(descending=True)[:self.top_k_knowledge].tolist()
 
-                return selected_knowledge
-            except Exception as e:
-                logger.warning(f"Lỗi khi tính toán độ tương đồng: {str(e)}")
+            selected = [all_sentences[idx] for idx in top_indices]
 
-        # Fallback: Sắp xếp theo điểm số tài liệu gốc
-        sorted_sentences = sorted(all_sentences, key=lambda x: x[2], reverse=True)
-        return sorted_sentences[:self.top_k_knowledge]
+        else:
+            # Fallback: use document scores
+            logger.debug("Using document scores for selection")
+            selected = sorted(all_sentences, key=lambda x: x[2], reverse=True)[:self.top_k_knowledge]
 
-    def prepare_generation_input(self, query, selected_knowledge, dialogue_history=None):
+        return selected
+
+    def prepare_generation_input(
+            self,
+            query: str,
+            selected_knowledge: List[Tuple[str, str, float]],
+            dialogue_history: Optional[List[str]] = None
+    ) -> str:
         """
-        Chuẩn bị đầu vào cho việc sinh phản hồi
-
-        Args:
-            query: Câu truy vấn
-            selected_knowledge: Danh sách tri thức đã chọn
-            dialogue_history: Lịch sử đối thoại
-
-        Returns:
-            Chuỗi đầu vào đã định dạng
+        Chuẩn bị input cho generation stage.
+        Format: Context + Query + Selected Knowledge → Response
         """
-        # Lấy lịch sử đối thoại với hyperlink
-        hyperlinked_history = None
-        if dialogue_history and self.hyperlink_processor:
-            hyperlinked_history = self.hyperlink_processor.get_hyperlinks_for_context(dialogue_history)
-
-        # Xây dựng phần ngữ cảnh
         context_parts = []
 
-        # Sử dụng lịch sử với hyperlink nếu có
-        history_to_use = hyperlinked_history if hyperlinked_history else dialogue_history
-
-        if history_to_use:
-            for i, utterance in enumerate(history_to_use):
+        # Add dialogue history
+        if dialogue_history:
+            for i, utterance in enumerate(dialogue_history):
                 speaker = "User1: " if i % 2 == 0 else "User2: "
                 context_parts.append(f"{speaker}{utterance}")
 
-        # Thêm truy vấn hiện tại
+        # Add current query
         current_speaker = "User1: " if len(context_parts) % 2 == 0 else "User2: "
         context_parts.append(f"{current_speaker}{query}")
 
         context_text = "\n".join(context_parts)
 
-        # Xây dựng phần tri thức
-        knowledge_parts = ["<knowledge>Thông tin tham khảo:"]
+        # Add selected knowledge
+        knowledge_parts = ["<knowledge>Reference Information:"]
 
         for i, (title, text, _) in enumerate(selected_knowledge):
             if i < self.top_k_knowledge:
-                # Sử dụng thẻ đánh dấu tri thức
                 knowledge_parts.append(f"<k{i + 1}>[{title}] {text}</k{i + 1}>")
 
         knowledge_parts.append("</knowledge>")
         knowledge_text = "\n".join(knowledge_parts)
 
-        # Kết hợp ngữ cảnh và tri thức
-        input_text = f"{context_text}\n\n{knowledge_text}\n\nPhản hồi:"
+        # Combine all parts
+        input_text = f"{context_text}\n\n{knowledge_text}\n\nResponse:"
 
         return input_text
 
-    def generate_response(self, input_text, max_length=128, num_beams=4, temperature=0.7):
+    def generate_response(
+            self,
+            input_text: str,
+            max_length: int = 128,
+            num_beams: int = 4,
+            temperature: float = 0.7,
+            do_sample: bool = False
+    ) -> str:
         """
-        Giai đoạn 4: Sinh phản hồi
-
-        Args:
-            input_text: Chuỗi đầu vào
-            max_length: Độ dài tối đa của phản hồi
-            num_beams: Số lượng beam trong beam search
-            temperature: Nhiệt độ ảnh hưởng đến tính đa dạng
-
-        Returns:
-            Phản hồi được sinh ra
+        Giai đoạn 4: RESPONSE GENERATION
+        Sinh câu trả lời dựa trên context và selected knowledge.
         """
-        # Mã hóa đầu vào
+        # Tokenize input
         inputs = self.tokenizer(
             input_text,
             return_tensors="pt",
@@ -967,7 +1036,7 @@ class EnhancedGenKSWithRAG:
             max_length=1024
         ).to(self.device)
 
-        # Sinh phản hồi
+        # Generate response
         with torch.no_grad():
             outputs = self.model.generate(
                 input_ids=inputs.input_ids,
@@ -975,26 +1044,22 @@ class EnhancedGenKSWithRAG:
                 max_length=max_length,
                 num_beams=num_beams,
                 no_repeat_ngram_size=3,
-                temperature=temperature
+                temperature=temperature,
+                do_sample=do_sample,
+                early_stopping=True
             )
 
-        # Giải mã đầu ra
+        # Decode response
         response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
         return response
 
-    def calculate_perplexity(self, input_text, target_text):
+    def calculate_perplexity(self, input_text: str, target_text: str) -> float:
         """
-        Tính perplexity (PPL) của target_text dựa trên input_text
-
-        Args:
-            input_text: Chuỗi đầu vào
-            target_text: Chuỗi đích cần tính PPL
-
-        Returns:
-            Giá trị PPL
+        Tính perplexity của target text given input.
+        Dùng để evaluate generation quality.
         """
-        # Mã hóa đầu vào
+        # Tokenize input và target
         inputs = self.tokenizer(
             input_text,
             return_tensors="pt",
@@ -1002,15 +1067,19 @@ class EnhancedGenKSWithRAG:
             max_length=1024
         ).to(self.device)
 
-        # Mã hóa đầu ra đích
-        labels = self.tokenizer(
-            target_text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=512
-        ).to(self.device).input_ids
+        with self.tokenizer.as_target_tokenizer():
+            labels = self.tokenizer(
+                target_text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+                padding=True
+            ).input_ids.to(self.device)
 
-        # Tính loss
+        # Replace padding với -100
+        labels[labels == self.tokenizer.pad_token_id] = -100
+
+        # Calculate loss
         with torch.no_grad():
             outputs = self.model(
                 input_ids=inputs.input_ids,
@@ -1019,104 +1088,145 @@ class EnhancedGenKSWithRAG:
             )
             loss = outputs.loss
 
-        # Tính perplexity
-        ppl = math.exp(loss.item())
+        # Perplexity = exp(loss)
+        ppl = math.exp(loss.item()) if loss is not None else float('inf')
 
         return ppl
 
-    def process_query(self, query, dialogue_history=None, use_generative_selection=None):
+    def process_query(
+            self,
+            query: str,
+            dialogue_history: Optional[List[str]] = None,
+            use_generative_selection: Optional[bool] = None,
+            verbose: bool = True
+    ) -> Dict[str, Any]:
         """
-        Xử lý truy vấn theo quy trình đầy đủ
+        ⭐ MAIN PIPELINE FUNCTION
+        Xử lý query qua đầy đủ 4 giai đoạn của RA-GenKS.
+        Đây là function quan trọng nhất cho inference và end-to-end evaluation.
 
         Args:
-            query: Câu truy vấn
-            dialogue_history: Lịch sử đối thoại
-            use_generative_selection: Có sử dụng phương pháp tạo sinh để chọn tri thức không
+            query: User query
+            dialogue_history: Previous dialogue turns
+            use_generative_selection: Override default selection method
+            verbose: Print detailed logs
 
         Returns:
-            Dict kết quả
+            Dict containing:
+            - response: Generated response
+            - retrieved_docs: Documents từ retrieval
+            - reranked_docs: Documents sau reranking
+            - selected_knowledge: Knowledge pieces đã chọn
+            - timing: Thời gian cho mỗi stage
+            - scores: Các metrics
         """
-        # Xác định phương pháp chọn tri thức
         if use_generative_selection is None:
             use_generative_selection = self.use_generative_selection
 
-        # Giai đoạn 1: Truy xuất tài liệu sơ bộ
+        if verbose:
+            logger.info("=" * 60)
+            logger.info("PROCESSING QUERY THROUGH RA-GENKS PIPELINE")
+            logger.info("=" * 60)
+            logger.info(f"Query: {query}")
+            if dialogue_history:
+                logger.info(f"Context: {len(dialogue_history)} previous turns")
+
+        timing = {}
+
+        # STAGE 1: RETRIEVAL
+        start_time = time.time()
         retrieved_docs = self.retrieve_documents(query, dialogue_history)
-        logger.info(f"Giai đoạn 1: Đã truy xuất {len(retrieved_docs)} tài liệu")
+        timing['retrieval'] = time.time() - start_time
 
-        # Giai đoạn 2: Xếp hạng lại
+        if verbose:
+            logger.info(f"✅ Stage 1 - Retrieval: {len(retrieved_docs)} docs in {timing['retrieval']:.2f}s")
+            if retrieved_docs:
+                logger.info(f"   Top doc: [{retrieved_docs[0][2]}] {retrieved_docs[0][1][:50]}...")
+
+        # STAGE 2: RERANKING
+        start_time = time.time()
         reranked_docs = self.rerank_documents(query, retrieved_docs, dialogue_history)
-        logger.info(f"Giai đoạn 2: Đã xếp hạng lại lấy {len(reranked_docs)} tài liệu tốt nhất")
+        timing['reranking'] = time.time() - start_time
 
-        # Lấy lịch sử đối thoại với hyperlink
-        hyperlinked_history = None
-        if dialogue_history and self.hyperlink_processor:
-            hyperlinked_history = self.hyperlink_processor.get_hyperlinks_for_context(dialogue_history)
+        if verbose:
+            logger.info(f"✅ Stage 2 - Reranking: Top {len(reranked_docs)} docs in {timing['reranking']:.2f}s")
+            if reranked_docs and reranked_docs[0] != retrieved_docs[0]:
+                logger.info(f"   New top doc: [{reranked_docs[0][2]}] {reranked_docs[0][1][:50]}...")
 
-        # Giai đoạn 3: Chọn tri thức
+        # STAGE 3: KNOWLEDGE SELECTION
+        start_time = time.time()
+
         if use_generative_selection:
-            # Phương pháp tạo sinh (GenKS)
+            # Prepare hyperlinked history if available
+            hyperlinked_history = None
+            if dialogue_history and self.hyperlink_processor:
+                hyperlinked_history = self.hyperlink_processor.get_hyperlinks_for_context(dialogue_history)
+
             selected_knowledge = self.select_knowledge_generatively(
                 query, reranked_docs, dialogue_history, hyperlinked_history
             )
-            logger.info(f"Giai đoạn 3: Đã chọn {len(selected_knowledge)} tri thức bằng phương pháp tạo sinh")
+            selection_method = "generative"
         else:
-            # Phương pháp dựa trên độ tương đồng
-            selected_knowledge = self.select_knowledge_by_similarity(query, reranked_docs, dialogue_history)
-            logger.info(f"Giai đoạn 3: Đã chọn {len(selected_knowledge)} tri thức dựa trên độ tương đồng")
+            selected_knowledge = self.select_knowledge_by_similarity(
+                query, reranked_docs, dialogue_history
+            )
+            selection_method = "similarity"
 
-        # Hiển thị tri thức đã chọn để debug
-        for i, (title, text, score) in enumerate(selected_knowledge):
-            logger.info(f"  Tri thức {i + 1}: [{title}] {text[:50]}... (score: {score:.4f})")
+        timing['selection'] = time.time() - start_time
 
-        # Chuẩn bị đầu vào cho việc sinh phản hồi
+        if verbose:
+            logger.info(
+                f"✅ Stage 3 - Knowledge Selection ({selection_method}): {len(selected_knowledge)} pieces in {timing['selection']:.2f}s")
+            for i, (title, text, score) in enumerate(selected_knowledge):
+                logger.info(f"   K{i + 1}: [{title}] {text[:60]}... (score: {score:.3f})")
+
+        # STAGE 4: RESPONSE GENERATION
+        start_time = time.time()
         input_text = self.prepare_generation_input(query, selected_knowledge, dialogue_history)
-
-        # Giai đoạn 4: Sinh phản hồi
         response = self.generate_response(input_text)
-        logger.info(f"Giai đoạn 4: Đã sinh phản hồi: {response[:50]}...")
+        timing['generation'] = time.time() - start_time
 
-        # Cập nhật hyperlink cho lượt đối thoại hiện tại
-        current_turn_id = len(dialogue_history) if dialogue_history else 0
-        if selected_knowledge and len(selected_knowledge) > 0:
+        if verbose:
+            logger.info(f"✅ Stage 4 - Generation: Response in {timing['generation']:.2f}s")
+            logger.info(f"   Response: {response[:100]}...")
+
+        # Calculate total time
+        timing['total'] = sum(timing.values())
+
+        if verbose:
+            logger.info(f"⏱️ Total pipeline time: {timing['total']:.2f}s")
+            logger.info("=" * 60)
+
+        # Update hyperlink processor for next turn
+        if selected_knowledge and dialogue_history is not None:
+            current_turn_id = len(dialogue_history)
             self.hyperlink_processor.add_hyperlink(
                 current_turn_id,
-                f"k1",  # Định danh của tri thức đầu tiên
-                selected_knowledge[0][0]  # Tiêu đề của tri thức đầu tiên
+                "k1",
+                selected_knowledge[0][0]
             )
-
-        # Tính PPL nếu có target_response
-        ppl = None
-        if 'target_response' in locals() and locals()['target_response']:
-            target_response = locals()['target_response']
-            ppl = self.calculate_perplexity(input_text, target_response)
-            logger.info(f"PPL của phản hồi mục tiêu: {ppl:.2f}")
 
         return {
             "response": response,
-            "retrieved_docs": retrieved_docs[:5],  # Chỉ trả về 5 tài liệu đầu tiên
-            "reranked_docs": reranked_docs[:3],
+            "retrieved_docs": retrieved_docs[:5],  # Top 5 for analysis
+            "reranked_docs": reranked_docs[:3],  # Top 3 for analysis
             "selected_knowledge": selected_knowledge,
-            "ppl": ppl,
-            "hyperlinked_history": self.hyperlink_processor.get_hyperlinks_for_context(
-                (dialogue_history or []) + [query]
-            )
+            "timing": timing,
+            "method": {
+                "retrieval": self.retrieval_method,
+                "selection": selection_method
+            }
         }
 
-    def save(self, path):
-        """
-        Lưu mô hình
-
-        Args:
-            path: Đường dẫn thư mục lưu mô hình
-        """
+    def save(self, path: str):
+        """Save model và configuration"""
         os.makedirs(path, exist_ok=True)
 
-        # Lưu mô hình và tokenizer
+        # Save model và tokenizer
         self.model.save_pretrained(os.path.join(path, "model"))
         self.tokenizer.save_pretrained(os.path.join(path, "tokenizer"))
 
-        # Lưu cấu hình
+        # Save configuration
         config = {
             "top_k_retrieval": self.top_k_retrieval,
             "top_k_rerank": self.top_k_rerank,
@@ -1126,22 +1236,16 @@ class EnhancedGenKSWithRAG:
         }
 
         with open(os.path.join(path, "config.json"), "w") as f:
-            json.dump(config, f)
+            json.dump(config, f, indent=2)
 
-        logger.info(f"Đã lưu mô hình vào {path}")
+        logger.info(f"Model saved to {path}")
 
-    def load(self, path, device=None):
-        """
-        Tải mô hình
-
-        Args:
-            path: Đường dẫn thư mục chứa mô hình
-            device: Thiết bị tính toán
-        """
+    def load(self, path: str, device: Optional[str] = None):
+        """Load model và configuration"""
         if device:
             self.device = device
 
-        # Tải mô hình và tokenizer
+        # Load model và tokenizer
         self.model = AutoModelForSeq2SeqLM.from_pretrained(
             os.path.join(path, "model")
         ).to(self.device)
@@ -1150,7 +1254,7 @@ class EnhancedGenKSWithRAG:
             os.path.join(path, "tokenizer")
         )
 
-        # Tải cấu hình
+        # Load configuration
         with open(os.path.join(path, "config.json"), "r") as f:
             config = json.load(f)
 
@@ -1160,424 +1264,937 @@ class EnhancedGenKSWithRAG:
         self.retrieval_method = config.get("retrieval_method", self.retrieval_method)
         self.use_generative_selection = config.get("use_generative_selection", self.use_generative_selection)
 
-        # Cập nhật bộ chọn tri thức tạo sinh
+        # Re-initialize selector
         self.generative_selector = GenerativeKnowledgeSelector(
             model=self.model,
             tokenizer=self.tokenizer,
             device=self.device
         )
 
-        logger.info(f"Đã tải mô hình từ {path}")
+        logger.info(f"Model loaded from {path}")
 
 
-def evaluate_enhanced_genks(
-        model,
-        eval_data,
-        output_file=None,
-        batch_size=8,
-        calculate_ppl=True
-):
+# ================================================================================
+# PHẦN 5: END-TO-END EVALUATION SYSTEM
+# ================================================================================
+
+class StageMetrics:
     """
-    Đánh giá mô hình GenKS cải tiến
-
-    Args:
-        model: Mô hình GenKS cải tiến
-        eval_data: Dữ liệu đánh giá
-        output_file: File lưu kết quả
-        batch_size: Kích thước batch
-        calculate_ppl: Có tính PPL hay không
-
-    Returns:
-        Dict kết quả đánh giá
+    Lưu trữ và tính toán metrics cho từng stage của pipeline.
+    Giúp phân tích chi tiết performance của từng component.
     """
-    logger.info(f"Đang đánh giá mô hình với {len(eval_data)} mẫu")
 
-    # Chuẩn bị tập dữ liệu đánh giá
-    eval_dataset = ImprovedMultiSpanGENKSData(
-        eval_data,
-        model.tokenizer,
-        context_len=256,
-        knowledge_len=64,
-        max_length=1024,
-        test=True,
-        top_k_knowledge=model.top_k_knowledge,
-        add_hyperlink=True
-    )
+    def __init__(self):
+        self.retrieval_metrics = defaultdict(list)
+        self.reranking_metrics = defaultdict(list)
+        self.selection_metrics = defaultdict(list)
+        self.generation_metrics = defaultdict(list)
+        self.end_to_end_metrics = defaultdict(list)
 
-    eval_dataloader = DataLoader(
-        eval_dataset,
-        collate_fn=eval_dataset.collate_fn,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=2
-    )
+    def add_metrics(self, stage: str, metrics: Dict):
+        """Add metrics cho một stage"""
+        stage_dict = getattr(self, f"{stage}_metrics")
+        for key, value in metrics.items():
+            if isinstance(value, (int, float)):
+                stage_dict[key].append(value)
 
-    # Đặt mô hình ở chế độ đánh giá
-    model.model.eval()
+    def compute_averages(self) -> Dict:
+        """Tính average của tất cả metrics"""
+        results = {}
 
-    # Chuẩn bị biến lưu trữ kết quả
-    output_texts = []
-    target_texts = []
-    ppls = []
+        for stage in ['retrieval', 'reranking', 'selection', 'generation', 'end_to_end']:
+            stage_metrics = getattr(self, f"{stage}_metrics")
+            stage_results = {}
 
-    # Tiến hành đánh giá
-    with torch.no_grad():
-        for batch in tqdm(eval_dataloader, total=len(eval_dataloader)):
-            # Chuyển batch sang thiết bị tính toán
-            batch = {k: v.to(model.device) for k, v in batch.items()}
+            for metric_name, values in stage_metrics.items():
+                if values:
+                    stage_results[metric_name] = {
+                        'mean': np.mean(values),
+                        'std': np.std(values),
+                        'min': np.min(values),
+                        'max': np.max(values)
+                    }
 
-            # Sinh phản hồi
-            outputs = model.model.generate(
-                input_ids=batch['input_ids'],
-                attention_mask=batch['attention_mask'],
-                max_length=512,
-                num_beams=4,
-                no_repeat_ngram_size=3,
-                temperature=0.7
+            if stage_results:
+                results[stage] = stage_results
+
+        return results
+
+
+class EndToEndEvaluator:
+    """
+    Evaluator cho end-to-end evaluation của RA-GenKS.
+    Đánh giá từng stage độc lập và cả pipeline.
+    """
+
+    def __init__(self, model: EnhancedRAGenKS):
+        self.model = model
+        self.metrics_tracker = StageMetrics()
+
+    def evaluate_retrieval_stage(
+            self,
+            query: str,
+            gold_knowledge: str,
+            gold_title: str,
+            dialogue_history: Optional[List[str]] = None,
+            top_k_values: List[int] = [1, 5, 10, 20, 50, 100]
+    ) -> Tuple[Dict, List]:
+        """
+        Đánh giá stage 1: Retrieval
+
+        Metrics:
+        - Recall@k: Gold document có trong top-k không
+        - MRR: Mean Reciprocal Rank của gold document
+        - Coverage: Bao nhiêu % gold knowledge được cover
+        """
+        # Retrieve documents
+        retrieved_docs = self.model.retrieve_documents(query, dialogue_history, top_k=max(top_k_values))
+
+        metrics = {}
+        gold_found = False
+        gold_rank = -1
+
+        # Find gold document position
+        for idx, (doc_id, doc_text, doc_title, doc_score) in enumerate(retrieved_docs):
+            # Check if this is the gold knowledge
+            if gold_knowledge in doc_text or (gold_title and gold_title in doc_title):
+                if not gold_found:
+                    gold_found = True
+                    gold_rank = idx + 1
+                    break
+
+        # Calculate Recall@k
+        for k in top_k_values:
+            recall_at_k = 1.0 if gold_found and gold_rank <= k else 0.0
+            metrics[f'recall@{k}'] = recall_at_k
+
+        # Calculate MRR
+        mrr = 1.0 / gold_rank if gold_rank > 0 else 0.0
+        metrics['mrr'] = mrr
+
+        # Calculate coverage
+        if retrieved_docs:
+            all_text = " ".join([doc[1] for doc in retrieved_docs[:20]])
+            gold_tokens = set(normalize_answer(gold_knowledge).split())
+            retrieved_tokens = set(normalize_answer(all_text).split())
+
+            if gold_tokens:
+                coverage = len(gold_tokens & retrieved_tokens) / len(gold_tokens)
+            else:
+                coverage = 0.0
+            metrics['coverage'] = coverage
+        else:
+            metrics['coverage'] = 0.0
+
+        metrics['retrieval_success'] = 1.0 if gold_found else 0.0
+
+        return metrics, retrieved_docs
+
+    def evaluate_reranking_stage(
+            self,
+            query: str,
+            retrieved_docs: List,
+            gold_knowledge: str,
+            gold_title: str,
+            dialogue_history: Optional[List[str]] = None
+    ) -> Tuple[Dict, List]:
+        """
+        Đánh giá stage 2: Reranking
+
+        Metrics:
+        - Position improvement: Gold document lên bao nhiêu vị trí
+        - NDCG: Normalized Discounted Cumulative Gain
+        - Reranked MRR
+        """
+        # Find initial position
+        initial_gold_rank = -1
+        for idx, (_, doc_text, doc_title, _) in enumerate(retrieved_docs):
+            if gold_knowledge in doc_text or (gold_title and gold_title in doc_title):
+                initial_gold_rank = idx + 1
+                break
+
+        # Rerank documents
+        reranked_docs = self.model.rerank_documents(query, retrieved_docs, dialogue_history)
+
+        # Find new position
+        reranked_gold_rank = -1
+        for idx, (_, doc_text, doc_title, _) in enumerate(reranked_docs):
+            if gold_knowledge in doc_text or (gold_title and gold_title in doc_title):
+                reranked_gold_rank = idx + 1
+                break
+
+        metrics = {}
+
+        # Position improvement
+        if initial_gold_rank > 0 and reranked_gold_rank > 0:
+            metrics['position_improvement'] = initial_gold_rank - reranked_gold_rank
+            metrics['rerank_success'] = 1.0 if reranked_gold_rank <= 5 else 0.0
+        else:
+            metrics['position_improvement'] = 0
+            metrics['rerank_success'] = 0.0
+
+        # Reranked MRR
+        metrics['reranked_mrr'] = 1.0 / reranked_gold_rank if reranked_gold_rank > 0 else 0.0
+
+        # NDCG calculation
+        if reranked_docs:
+            # Create relevance scores
+            relevance_scores = []
+            for doc in reranked_docs[:10]:
+                is_relevant = gold_knowledge in doc[1] or (gold_title and gold_title in doc[2])
+                relevance_scores.append(1.0 if is_relevant else 0.0)
+
+            if sum(relevance_scores) > 0:
+                ideal_scores = sorted(relevance_scores, reverse=True)
+                try:
+                    metrics['ndcg@10'] = ndcg_score([ideal_scores], [relevance_scores])
+                except:
+                    metrics['ndcg@10'] = 0.0
+            else:
+                metrics['ndcg@10'] = 0.0
+
+        return metrics, reranked_docs
+
+    def evaluate_selection_stage(
+            self,
+            query: str,
+            reranked_docs: List,
+            gold_knowledge: str,
+            dialogue_history: Optional[List[str]] = None,
+            use_generative: bool = True
+    ) -> Tuple[Dict, List]:
+        """
+        Đánh giá stage 3: Knowledge Selection
+
+        Metrics:
+        - Exact match: Chọn chính xác gold knowledge
+        - Partial match: Có overlap với gold knowledge
+        - Selection F1
+        """
+        # Select knowledge
+        if use_generative:
+            selected_knowledge = self.model.select_knowledge_generatively(
+                query, reranked_docs, dialogue_history
+            )
+        else:
+            selected_knowledge = self.model.select_knowledge_by_similarity(
+                query, reranked_docs, dialogue_history
             )
 
-            # Giải mã đầu ra và đích
-            for i in range(outputs.size(0)):
-                # Giải mã phản hồi sinh ra
-                output_text = model.tokenizer.decode(outputs[i], skip_special_tokens=True)
-                output_texts.append(output_text)
+        metrics = {}
 
-                # Giải mã phản hồi đích
-                target_ids = batch['labels'][i].clone()
-                target_ids[target_ids == -100] = model.tokenizer.pad_token_id
-                target_text = model.tokenizer.decode(target_ids, skip_special_tokens=True)
-                target_texts.append(target_text)
-
-                # Tính PPL nếu cần
-                if calculate_ppl:
-                    # Lấy đầu vào
-                    input_ids = batch['input_ids'][i].clone()
-                    input_text = model.tokenizer.decode(input_ids, skip_special_tokens=False)
-
-                    # Tính PPL
-                    ppl = model.calculate_perplexity(input_text, target_text)
-                    ppls.append(ppl)
-
-    # Tính toán các metrics
-    # Chuẩn bị dữ liệu
-    refs = [[ref.lower().split()] for ref in target_texts]
-    hyps = [hyp.lower().split() for hyp in output_texts]
-
-    # Tính BLEU
-    smoothie = SmoothingFunction().method1
-    bleu1 = sum([sentence_bleu([ref[0]], hyp, weights=(1, 0, 0, 0), smoothing_function=smoothie)
-                 for ref, hyp in zip(refs, hyps)]) / len(refs)
-    bleu4 = sum([sentence_bleu([ref[0]], hyp, weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smoothie)
-                 for ref, hyp in zip(refs, hyps)]) / len(refs)
-
-    # Tính ROUGE
-    rouge = Rouge()
-    try:
-        rouge_scores = rouge.get_scores(
-            [' '.join(hyp) for hyp in hyps],
-            [' '.join(ref[0]) for ref in refs],
-            avg=True
+        # Exact match
+        exact_match = any(
+            gold_knowledge == knowledge[1]
+            for knowledge in selected_knowledge
         )
-    except Exception as e:
-        logger.warning(f"Lỗi khi tính ROUGE: {str(e)}")
-        rouge_scores = {'rouge-1': {'f': 0.0}, 'rouge-2': {'f': 0.0}, 'rouge-l': {'f': 0.0}}
+        metrics['exact_match'] = 1.0 if exact_match else 0.0
 
-    # Tính Knowledge F1 (KF1)
-    def f1_score(prediction, ground_truth):
-        """Tính F1 giữa dự đoán và ground truth"""
-        prediction_tokens = prediction.split()
-        ground_truth_tokens = ground_truth.split()
-        common = set(prediction_tokens) & set(ground_truth_tokens)
-        num_same = len(common)
+        # Partial match và overlap
+        max_overlap = 0.0
+        gold_tokens = set(normalize_answer(gold_knowledge).split())
 
-        if num_same == 0:
-            return 0
+        for title, text, score in selected_knowledge:
+            selected_tokens = set(normalize_answer(text).split())
 
-        precision = 1.0 * num_same / len(prediction_tokens)
-        recall = 1.0 * num_same / len(ground_truth_tokens)
-        f1 = (2 * precision * recall) / (precision + recall)
+            if gold_tokens:
+                overlap = len(gold_tokens & selected_tokens) / len(gold_tokens)
+                max_overlap = max(max_overlap, overlap)
 
-        return f1
+        metrics['partial_match'] = 1.0 if max_overlap >= 0.5 else 0.0
+        metrics['max_overlap'] = max_overlap
 
-    kf1 = sum([f1_score(' '.join(hyp), ' '.join(ref[0]))
-               for hyp, ref in zip(hyps, refs)]) / len(refs)
+        # Selection F1
+        if selected_knowledge and gold_tokens:
+            all_selected = " ".join([text for _, text, _ in selected_knowledge])
+            selected_tokens = set(normalize_answer(all_selected).split())
 
-    # Tính trung bình PPL
-    avg_ppl = sum(ppls) / len(ppls) if ppls else None
+            common = gold_tokens & selected_tokens
+            if common:
+                precision = len(common) / len(selected_tokens)
+                recall = len(common) / len(gold_tokens)
+                f1 = 2 * precision * recall / (precision + recall)
+            else:
+                f1 = 0.0
 
-    # Tổng hợp kết quả
-    results = {
-        'bleu1': bleu1 * 100,
-        'bleu4': bleu4 * 100,
-        'rouge1': rouge_scores['rouge-1']['f'] * 100,
-        'rouge2': rouge_scores['rouge-2']['f'] * 100,
-        'rougeL': rouge_scores['rouge-l']['f'] * 100,
-        'kf1': kf1 * 100,
-        'ppl': avg_ppl
-    }
+            metrics['selection_precision'] = precision if 'precision' in locals() else 0.0
+            metrics['selection_recall'] = recall if 'recall' in locals() else 0.0
+            metrics['selection_f1'] = f1
+        else:
+            metrics['selection_precision'] = 0.0
+            metrics['selection_recall'] = 0.0
+            metrics['selection_f1'] = 0.0
 
-    # Hiển thị kết quả
-    logger.info("Kết quả đánh giá:")
-    for metric, value in results.items():
-        if value is not None:
-            logger.info(f"{metric}: {value:.2f}")
+        return metrics, selected_knowledge
 
-    # Lưu kết quả nếu cần
-    if output_file:
-        with open(output_file, 'w') as f:
-            json.dump(results, f, indent=2)
+    def evaluate_generation_stage(
+            self,
+            query: str,
+            selected_knowledge: List,
+            target_response: str,
+            gold_knowledge: str,
+            dialogue_history: Optional[List[str]] = None
+    ) -> Tuple[Dict, str]:
+        """
+        Đánh giá stage 4: Response Generation
 
-        # Lưu mẫu phản hồi
-        sample_file = output_file.replace('.json', '_samples.txt')
-        with open(sample_file, 'w') as f:
-            for i, (pred, ref) in enumerate(zip(output_texts[:20], target_texts[:20])):  # Lưu 20 mẫu đầu tiên
-                f.write(f"Mẫu {i + 1}:\n")
-                f.write(f"Dự đoán: {pred}\n")
-                f.write(f"Tham chiếu: {ref}\n")
-                f.write("-" * 80 + "\n")
+        Metrics:
+        - BLEU, ROUGE, F1
+        - Knowledge F1 (hallucination detection)
+        - Faithfulness
+        """
+        # Generate response
+        input_text = self.model.prepare_generation_input(query, selected_knowledge, dialogue_history)
+        generated_response = self.model.generate_response(input_text)
 
-    return results
+        metrics = {}
+
+        # BLEU scores
+        ref_tokens = target_response.lower().split()
+        hyp_tokens = generated_response.lower().split()
+
+        smoothie = SmoothingFunction().method1
+        metrics['bleu1'] = sentence_bleu([ref_tokens], hyp_tokens,
+                                         weights=(1, 0, 0, 0),
+                                         smoothing_function=smoothie)
+        metrics['bleu4'] = sentence_bleu([ref_tokens], hyp_tokens,
+                                         weights=(0.25, 0.25, 0.25, 0.25),
+                                         smoothing_function=smoothie)
+
+        # ROUGE scores
+        try:
+            rouge = Rouge()
+            rouge_scores = rouge.get_scores(generated_response.lower(), target_response.lower())[0]
+            metrics['rouge1'] = rouge_scores['rouge-1']['f']
+            metrics['rouge2'] = rouge_scores['rouge-2']['f']
+            metrics['rougeL'] = rouge_scores['rouge-l']['f']
+        except:
+            metrics['rouge1'] = 0.0
+            metrics['rouge2'] = 0.0
+            metrics['rougeL'] = 0.0
+
+        # F1 scores
+        metrics['unigram_f1'] = calculate_unigram_f1(generated_response, target_response)
+        metrics['knowledge_f1'] = calculate_knowledge_f1(generated_response, gold_knowledge)
+
+        # Faithfulness và hallucination
+        if selected_knowledge:
+            selected_text = " ".join([text for _, text, _ in selected_knowledge])
+            response_tokens = set(normalize_answer(generated_response).split())
+            knowledge_tokens = set(normalize_answer(selected_text).split())
+
+            if response_tokens:
+                # Faithfulness: % response traceable to knowledge
+                traceable = response_tokens & knowledge_tokens
+                metrics['faithfulness'] = len(traceable) / len(response_tokens)
+
+                # Hallucination: tokens not in knowledge or dialogue
+                all_context = selected_text
+                if dialogue_history:
+                    all_context += " " + " ".join(dialogue_history)
+
+                context_tokens = set(normalize_answer(all_context).split())
+                hallucinated = response_tokens - context_tokens
+                metrics['hallucination_rate'] = len(hallucinated) / len(response_tokens)
+            else:
+                metrics['faithfulness'] = 0.0
+                metrics['hallucination_rate'] = 1.0
+        else:
+            metrics['faithfulness'] = 0.0
+            metrics['hallucination_rate'] = 1.0
+
+        # Perplexity
+        ppl = self.model.calculate_perplexity(input_text, target_response)
+        metrics['perplexity'] = ppl
+
+        return metrics, generated_response
+
+    def evaluate_sample(
+            self,
+            example: Dict,
+            use_generative_selection: bool = True,
+            verbose: bool = False
+    ) -> Dict:
+        """
+        Đánh giá một sample qua toàn bộ pipeline.
+
+        Returns:
+            Dict chứa metrics cho từng stage và overall
+        """
+        # Extract information từ example
+        query = example.get('query', '') or example.get('text', '')
+        dialogue_history = []
+
+        if 'context' in example:
+            for turn in example['context']:
+                dialogue_history.append(turn.get('text', ''))
+
+        gold_knowledge = example.get('checked_sentence', '')
+        gold_title = example.get('title', '')
+        target_response = example.get('response', '') or (
+            example.get('labels', [''])[0] if 'labels' in example else ''
+        )
+
+        # Skip nếu không có gold knowledge
+        if not gold_knowledge or gold_knowledge == 'no_passages_used':
+            return {}
+
+        results = {}
+
+        # Stage 1: Retrieval
+        retrieval_metrics, retrieved_docs = self.evaluate_retrieval_stage(
+            query, gold_knowledge, gold_title, dialogue_history
+        )
+        results['retrieval'] = retrieval_metrics
+
+        # Stage 2: Reranking
+        reranking_metrics, reranked_docs = self.evaluate_reranking_stage(
+            query, retrieved_docs[:100], gold_knowledge, gold_title, dialogue_history
+        )
+        results['reranking'] = reranking_metrics
+
+        # Stage 3: Selection
+        selection_metrics, selected_knowledge = self.evaluate_selection_stage(
+            query, reranked_docs, gold_knowledge, dialogue_history, use_generative_selection
+        )
+        results['selection'] = selection_metrics
+
+        # Stage 4: Generation
+        generation_metrics, generated_response = self.evaluate_generation_stage(
+            query, selected_knowledge, target_response, gold_knowledge, dialogue_history
+        )
+        results['generation'] = generation_metrics
+
+        # Overall metrics
+        results['end_to_end'] = {
+            'pipeline_success': (
+                    results['retrieval']['retrieval_success'] *
+                    results['selection']['partial_match'] *
+                    (1 - results['generation']['hallucination_rate'])
+            ),
+            'combined_score': (
+                    0.2 * results['retrieval'].get('recall@10', 0) +
+                    0.2 * results['selection'].get('selection_f1', 0) +
+                    0.3 * results['generation'].get('unigram_f1', 0) +
+                    0.3 * results['generation'].get('knowledge_f1', 0)
+            )
+        }
+
+        # Store in tracker
+        for stage, metrics in results.items():
+            self.metrics_tracker.add_metrics(stage, metrics)
+
+        if verbose:
+            logger.info(f"Sample evaluation complete. Combined score: {results['end_to_end']['combined_score']:.3f}")
+
+        return results
 
 
-def train_enhanced_genks(
-        model,
-        train_data,
-        eval_data=None,
-        output_dir='/kaggle/working/ckpt/enhanced_genks',
-        epochs=3,
-        batch_size=8,
-        accumulation_steps=4,
-        learning_rate=2e-5,
-        warmup_steps=500,
-        max_grad_norm=1.0
-):
+def run_end_to_end_evaluation(
+        model: EnhancedRAGenKS,
+        eval_data: List[Dict],
+        output_dir: str = './evaluation_results',
+        num_samples: Optional[int] = None,
+        run_ablation: bool = True,
+        verbose: bool = False
+) -> Dict:
     """
-    Huấn luyện mô hình GenKS cải tiến
+    Chạy end-to-end evaluation trên dataset.
 
     Args:
-        model: Mô hình GenKS cải tiến
-        train_data: Dữ liệu huấn luyện
-        eval_data: Dữ liệu đánh giá
-        output_dir: Thư mục lưu mô hình
-        epochs: Số epochs
-        batch_size: Kích thước batch
-        accumulation_steps: Số bước tích lũy gradient
-        learning_rate: Tốc độ học
-        warmup_steps: Số bước làm nóng
-        max_grad_norm: Ngưỡng cắt gradient
+        model: Trained RA-GenKS model
+        eval_data: Evaluation dataset
+        output_dir: Directory để save results
+        num_samples: Number of samples to evaluate (None = all)
+        run_ablation: Run ablation study với different configurations
+        verbose: Print detailed logs
 
     Returns:
-        Mô hình đã huấn luyện
+        Dict chứa aggregated results
     """
-    # Khởi tạo accelerator
-    accelerator = Accelerator(
-        gradient_accumulation_steps=accumulation_steps
-    )
+    logger.info("=" * 80)
+    logger.info("RUNNING END-TO-END EVALUATION")
+    logger.info("=" * 80)
 
-    logger.info(f"Đang huấn luyện mô hình với {len(train_data)} mẫu trong {epochs} epochs")
+    os.makedirs(output_dir, exist_ok=True)
 
-    # Chuẩn bị tập dữ liệu
-    train_dataset = ImprovedMultiSpanGENKSData(
+    # Prepare data
+    if num_samples:
+        eval_data = eval_data[:num_samples]
+
+    logger.info(f"Evaluating {len(eval_data)} samples...")
+
+    # Configurations to test
+    if run_ablation:
+        configs = [
+            {'name': 'full_pipeline', 'use_generative': True, 'use_rerank': True},
+            {'name': 'no_generative', 'use_generative': False, 'use_rerank': True},
+            {'name': 'no_rerank', 'use_generative': True, 'use_rerank': False},
+            {'name': 'baseline', 'use_generative': False, 'use_rerank': False}
+        ]
+    else:
+        configs = [{'name': 'full_pipeline', 'use_generative': True, 'use_rerank': True}]
+
+    all_results = {}
+
+    for config in configs:
+        logger.info(f"\nEvaluating configuration: {config['name']}")
+
+        # Create evaluator
+        evaluator = EndToEndEvaluator(model)
+
+        # Temporarily modify model settings for ablation
+        original_use_generative = model.use_generative_selection
+        model.use_generative_selection = config['use_generative']
+
+        # Evaluate samples
+        sample_results = []
+        for idx, example in enumerate(tqdm(eval_data, desc=f"Evaluating {config['name']}")):
+            result = evaluator.evaluate_sample(example, config['use_generative'], verbose=verbose)
+            if result:  # Skip samples without gold knowledge
+                sample_results.append(result)
+
+        # Restore original settings
+        model.use_generative_selection = original_use_generative
+
+        # Aggregate results
+        aggregated = evaluator.metrics_tracker.compute_averages()
+        all_results[config['name']] = {
+            'aggregated': aggregated,
+            'num_samples': len(sample_results)
+        }
+
+        # Print summary
+        logger.info(f"\n📊 Results for {config['name']}:")
+        logger.info("-" * 60)
+
+        for stage in ['retrieval', 'reranking', 'selection', 'generation', 'end_to_end']:
+            if stage in aggregated:
+                logger.info(f"\n{stage.upper()} Stage:")
+                stage_metrics = aggregated[stage]
+
+                # Select key metrics to display
+                key_metrics = {
+                    'retrieval': ['recall@10', 'mrr', 'coverage'],
+                    'reranking': ['position_improvement', 'reranked_mrr', 'ndcg@10'],
+                    'selection': ['exact_match', 'partial_match', 'selection_f1'],
+                    'generation': ['unigram_f1', 'knowledge_f1', 'faithfulness', 'hallucination_rate'],
+                    'end_to_end': ['pipeline_success', 'combined_score']
+                }
+
+                for metric in key_metrics.get(stage, []):
+                    if metric in stage_metrics:
+                        value = stage_metrics[metric]['mean']
+                        std = stage_metrics[metric]['std']
+                        logger.info(f"  {metric:25s}: {value:.3f} (±{std:.3f})")
+
+    # Ablation analysis
+    if run_ablation and len(configs) > 1:
+        logger.info("\n" + "=" * 80)
+        logger.info("ABLATION STUDY RESULTS")
+        logger.info("=" * 80)
+
+        baseline = all_results.get('baseline', {}).get('aggregated', {})
+        full = all_results.get('full_pipeline', {}).get('aggregated', {})
+
+        if baseline and full:
+            # Calculate improvements
+            improvements = {}
+
+            # Overall improvement
+            baseline_score = baseline.get('end_to_end', {}).get('combined_score', {}).get('mean', 0)
+            full_score = full.get('end_to_end', {}).get('combined_score', {}).get('mean', 0)
+            overall_improvement = (full_score - baseline_score) * 100
+
+            logger.info(f"\n📈 Overall Improvement: +{overall_improvement:.2f}%")
+            logger.info(f"  Baseline score: {baseline_score:.3f}")
+            logger.info(f"  Full pipeline: {full_score:.3f}")
+
+            # Component contributions
+            if 'no_generative' in all_results:
+                no_gen = all_results['no_generative']['aggregated']
+                no_gen_score = no_gen.get('end_to_end', {}).get('combined_score', {}).get('mean', 0)
+                gen_contribution = (full_score - no_gen_score) * 100
+                logger.info(f"\n  Generative selection contribution: +{gen_contribution:.2f}%")
+
+            if 'no_rerank' in all_results:
+                no_rerank = all_results['no_rerank']['aggregated']
+                no_rerank_score = no_rerank.get('end_to_end', {}).get('combined_score', {}).get('mean', 0)
+                rerank_contribution = (full_score - no_rerank_score) * 100
+                logger.info(f"  Reranking contribution: +{rerank_contribution:.2f}%")
+
+    # Save results
+    results_file = os.path.join(output_dir, 'evaluation_results.json')
+    with open(results_file, 'w', encoding='utf-8') as f:
+        json.dump(all_results, f, indent=2, ensure_ascii=False, default=str)
+
+    logger.info(f"\n✅ Results saved to {results_file}")
+
+    return all_results
+
+
+# ================================================================================
+# PHẦN 6: TRAINING FUNCTIONS
+# ================================================================================
+
+def train_ragenks(
+        model: EnhancedRAGenKS,
+        train_data: List[Dict],
+        valid_data: List[Dict],
+        output_dir: str = './checkpoints',
+        epochs: int = 3,
+        batch_size: int = 4,
+        learning_rate: float = 2e-5,
+        warmup_steps: int = 500,
+        gradient_accumulation_steps: int = 4,
+        max_grad_norm: float = 1.0,
+        evaluate_every_n_steps: int = 500,
+        save_every_n_steps: int = 1000,
+        gpu_monitor: Optional[GPUMonitor] = None
+) -> EnhancedRAGenKS:
+    """
+    Train RA-GenKS model với teacher forcing.
+
+    Trong training, model học từ gold knowledge (không run full pipeline).
+    Evaluation sẽ test full pipeline riêng.
+    """
+    accelerator = Accelerator(gradient_accumulation_steps=gradient_accumulation_steps)
+
+    logger.info(f"Training RA-GenKS for {epochs} epochs with {len(train_data)} samples")
+
+    if gpu_monitor:
+        gpu_monitor.log_stats("training_start")
+
+    # Create datasets
+    train_dataset = RAGenKSDataset(
         train_data,
         model.tokenizer,
-        context_len=512,
-        knowledge_len=128,
-        max_length=1024,
         test=False,
-        top_k_knowledge=model.top_k_knowledge,
-        add_hyperlink=True
+        top_k_knowledge=model.top_k_knowledge
     )
 
+    valid_dataset = RAGenKSDataset(
+        valid_data,
+        model.tokenizer,
+        test=True,
+        top_k_knowledge=model.top_k_knowledge
+    )
+
+    # Create dataloaders
     train_dataloader = DataLoader(
         train_dataset,
-        collate_fn=train_dataset.collate_fn,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=2
+        num_workers=4
     )
 
-    # Tổng số bước huấn luyện
-    total_steps = len(train_dataloader) * epochs // accumulation_steps
+    valid_dataloader = DataLoader(
+        valid_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4
+    )
 
-    # Khởi tạo optimizer và scheduler
+    # Setup optimizer và scheduler
+    total_steps = len(train_dataloader) * epochs // gradient_accumulation_steps
+
     optimizer = AdamW(
         model.model.parameters(),
         lr=learning_rate,
         weight_decay=0.01
     )
 
-    # Scheduler với warmup
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
         num_training_steps=total_steps
     )
 
-    # Chuẩn bị với accelerator
-    model.model, optimizer, train_dataloader, scheduler = accelerator.prepare(
-        model.model, optimizer, train_dataloader, scheduler
+    # Prepare for distributed training
+    model.model, optimizer, train_dataloader, valid_dataloader, scheduler = accelerator.prepare(
+        model.model, optimizer, train_dataloader, valid_dataloader, scheduler
     )
 
-    # Vòng lặp huấn luyện
-    best_eval_result = 0
+    # Training variables
+    global_step = 0
+    best_valid_loss = float('inf')
+    training_history = []
+
+    logger.info("Starting training...")
 
     for epoch in range(epochs):
-        # Đảm bảo tất cả các tiến trình đồng bộ
-        accelerator.wait_for_everyone()
-
+        logger.info(f"\n{'=' * 60}")
         logger.info(f"Epoch {epoch + 1}/{epochs}")
+        logger.info(f"{'=' * 60}")
 
-        # Đặt mô hình ở chế độ huấn luyện
+        # Training phase
         model.model.train()
+        train_loss = 0
+        train_steps = 0
 
-        # Thanh tiến trình
-        progress_bar = tqdm(train_dataloader, total=len(train_dataloader))
-        running_loss = 0
+        progress_bar = tqdm(train_dataloader, desc=f"Training epoch {epoch + 1}")
 
-        # Duyệt qua các batch
-        for step, batch in enumerate(progress_bar):
-            # Tích lũy gradient
+        for batch_idx, batch in enumerate(progress_bar):
             with accelerator.accumulate(model.model):
-                # Forward pass
                 outputs = model.model(**batch)
                 loss = outputs.loss
 
-                # Backward pass
                 accelerator.backward(loss)
 
-                # Cắt gradient để tránh bùng nổ
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.model.parameters(), max_grad_norm)
 
-                # Cập nhật tham số
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
 
-            # Cập nhật thanh tiến trình
-            running_loss += loss.item()
-            progress_bar.set_description(f"Loss: {running_loss / (step + 1):.4f}")
+            train_loss += loss.item()
+            train_steps += 1
+            global_step += 1
 
-        # Lưu mô hình sau mỗi epoch
-        if accelerator.is_main_process:
-            os.makedirs(output_dir, exist_ok=True)
-            unwrapped_model = accelerator.unwrap_model(model.model)
-            unwrapped_model.save_pretrained(f"{output_dir}/epoch_{epoch + 1}")
-            model.tokenizer.save_pretrained(f"{output_dir}/epoch_{epoch + 1}")
+            # Update progress bar
+            progress_bar.set_postfix({
+                'loss': train_loss / train_steps,
+                'lr': scheduler.get_last_lr()[0]
+            })
 
-        # Đánh giá nếu có dữ liệu đánh giá
-        if eval_data:
-            # Unwrap mô hình
-            model.model = accelerator.unwrap_model(model.model)
+            # Periodic evaluation
+            if global_step % evaluate_every_n_steps == 0:
+                logger.info(f"\nEvaluating at step {global_step}...")
 
-            # Tiến hành đánh giá
-            eval_results = evaluate_enhanced_genks(
-                model=model,
-                eval_data=eval_data,
-                output_file=f"{output_dir}/eval_results_epoch_{epoch + 1}.json",
-                batch_size=batch_size,
-                calculate_ppl=True
-            )
+                model.model.eval()
+                valid_loss = 0
+                valid_steps = 0
 
-            # Kiểm tra xem đây có phải mô hình tốt nhất hay không
-            current_metric = eval_results.get('kf1', 0) + eval_results.get('bleu4', 0)
+                with torch.no_grad():
+                    for batch in tqdm(valid_dataloader, desc="Validation"):
+                        outputs = model.model(**batch)
+                        valid_loss += outputs.loss.item()
+                        valid_steps += 1
 
-            if current_metric > best_eval_result:
-                best_eval_result = current_metric
+                avg_valid_loss = valid_loss / valid_steps
 
-                # Lưu mô hình tốt nhất
-                if accelerator.is_main_process:
-                    logger.info(f"Tìm thấy mô hình tốt nhất ở epoch {epoch + 1}")
-                    model.save(f"{output_dir}/best_model")
+                logger.info(f"Step {global_step} - Valid loss: {avg_valid_loss:.4f}")
 
-            # Wrap lại mô hình
-            model.model = accelerator.prepare(model.model)
+                # Save best model
+                if avg_valid_loss < best_valid_loss:
+                    best_valid_loss = avg_valid_loss
 
-    # Lưu mô hình cuối cùng
+                    if accelerator.is_main_process:
+                        save_path = os.path.join(output_dir, 'best_model')
+                        os.makedirs(save_path, exist_ok=True)
+
+                        unwrapped_model = accelerator.unwrap_model(model.model)
+                        model.model = unwrapped_model  # Temporarily unwrap
+                        model.save(save_path)
+                        model.model = accelerator.prepare(unwrapped_model)  # Re-wrap
+
+                        logger.info(f"✅ Saved new best model (loss: {best_valid_loss:.4f})")
+
+                model.model.train()
+
+            # Periodic checkpoint
+            # if global_step % save_every_n_steps == 0 and accelerator.is_main_process:
+            #     save_path = os.path.join(output_dir, f'checkpoint_{global_step}')
+            #     os.makedirs(save_path, exist_ok=True)
+            #
+            #     unwrapped_model = accelerator.unwrap_model(model.model)
+            #     model.model = unwrapped_model
+            #     model.save(save_path)
+            #     model.model = accelerator.prepare(unwrapped_model)
+            #
+            #     logger.info(f"💾 Saved checkpoint at step {global_step}")
+
+        # End of epoch evaluation
+        avg_train_loss = train_loss / train_steps
+        logger.info(f"\nEpoch {epoch + 1} complete. Average training loss: {avg_train_loss:.4f}")
+
+        if gpu_monitor:
+            gpu_monitor.log_stats(f"epoch_{epoch + 1}_complete", {
+                'train_loss': avg_train_loss,
+                'best_valid_loss': best_valid_loss
+            })
+
+        training_history.append({
+            'epoch': epoch + 1,
+            'train_loss': avg_train_loss,
+            'best_valid_loss': best_valid_loss
+        })
+
+    # Save final model
     if accelerator.is_main_process:
-        model.save(f"{output_dir}/final_model")
+        save_path = os.path.join(output_dir, 'final_model')
+        os.makedirs(save_path, exist_ok=True)
+
+        unwrapped_model = accelerator.unwrap_model(model.model)
+        model.model = unwrapped_model
+        model.save(save_path)
+
+        # Save training history
+        history_file = os.path.join(output_dir, 'training_history.json')
+        with open(history_file, 'w') as f:
+            json.dump(training_history, f, indent=2)
+
+    logger.info("✅ Training complete!")
 
     return model
 
-
 def main():
-    """Hàm chính để chạy quá trình huấn luyện và đánh giá"""
-    # Thiết lập logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
+    """
+    Main function để chạy complete RA-GenKS system.
 
-    # Khởi tạo mô hình
-    model = EnhancedGenKSWithRAG(
-        model_name='facebook/bart-base',
-        retriever_model_name='facebook/dpr-ctx_encoder-single-nq-base',
-        query_encoder_name='facebook/dpr-question_encoder-single-nq-base',
-        ranker_model_name='cross-encoder/ms-marco-MiniLM-L-6-v2',
-        top_k_retrieval=100,
-        top_k_rerank=20,
-        top_k_knowledge=3,
-        retrieval_method='bm25',
-        use_generative_selection=True,
-        device='cuda'
-    )
+    Pipeline:
+    1. Load data
+    2. Build corpus index
+    3. Train model
+    4. Run end-to-end evaluation
+    5. Demo với process_query
+    """
+    logger.info("=" * 80)
+    logger.info("RA-GENKS COMPLETE SYSTEM")
+    logger.info("Retrieval-Augmented Generation with Knowledge Selection")
+    logger.info("=" * 80)
 
-    # Tải dữ liệu từ file JSON
-    train_data = json.load(open('/kaggle/input/wizard/train30.json'))
+    # Configuration
+    config = {
+        'model_name': 'facebook/bart-base',
+        'retrieval_method': 'bm25',  # 'bm25', 'dpr', 'sentence_bert'
+        'use_generative_selection': True,
+        'top_k_retrieval': 100,
+        'top_k_rerank': 20,
+        'top_k_knowledge': 3,
+        'batch_size': 4,
+        'epochs': 3,
+        'learning_rate': 2e-5,
+        'data_dir': '/kaggle/input/wizard',
+        'output_dir': '/kaggle/working/ckpt/enhanced_genks',
+        'cache_dir': '/kaggle/working/ckpt/cache'
+    }
+
+    # Create directories
+    os.makedirs(config['output_dir'], exist_ok=True)
+    os.makedirs(config['cache_dir'], exist_ok=True)
+
+    # Initialize GPU monitor
+    gpu_monitor = GPUMonitor()
+    gpu_monitor.start_monitoring()
+
+    # Step 1: Load data
+    logger.info("\n📚 Step 1: Loading data...")
+    train_data = json.load(open('/kaggle/input/wizard/train.json'))
     valid_data = json.load(open('/kaggle/input/wizard/valid_seen.json'))
-    test_seen_data = json.load(open('/kaggle/input/wizard/test_seen.json'))
-    test_unseen_data = json.load(open('/kaggle/input/wizard/test_unseen.json'))
+    test_data = json.load(open('/kaggle/input/wizard/test_seen.json'))
 
-    # Xây dựng corpus từ dữ liệu huấn luyện
-    corpus = []
-    for i, example in enumerate(train_data):
-        if 'knowledge' in example:
-            for title, sentences in example['knowledge'].items():
-                for j, sentence in enumerate(sentences):
-                    doc_id = f"doc_{i}_{j}"
-                    corpus.append((doc_id, sentence, title))
+    # Use subset for quick testing (remove this for full training)
+    # if len(train_data) > 1000:
+    #     logger.info("Using subset of data for quick testing...")
+    #     train_data = train_data[:1000]
+    #     valid_data = valid_data[:200]
+    #     test_data = test_data[:200]
 
-    # Xây dựng chỉ mục cho corpus
-    model.build_corpus_index(corpus, cache_path='/kaggle/working/ckpt/embeddings_cache.pt')
+    # Step 2: Initialize model
+    logger.info("\n🤖 Step 2: Initializing RA-GenKS model...")
+    model = EnhancedRAGenKS(
+        model_name=config['model_name'],
+        retrieval_method=config['retrieval_method'],
+        use_generative_selection=config['use_generative_selection'],
+        top_k_retrieval=config['top_k_retrieval'],
+        top_k_rerank=config['top_k_rerank'],
+        top_k_knowledge=config['top_k_knowledge'],
+        cache_dir=config['cache_dir']
+    )
 
-    # Huấn luyện mô hình
-    model = train_enhanced_genks(
+    # Step 3: Build corpus index
+    logger.info("\n🔍 Step 3: Building corpus index...")
+    corpus_cache = os.path.join(config['cache_dir'], f'corpus_embeddings_{config["retrieval_method"]}.pt')
+    model.build_corpus_index(train_data + valid_data, cache_path=corpus_cache)
+
+    # Step 4: Train model
+    logger.info("\n🎯 Step 4: Training model...")
+    model = train_ragenks(
         model=model,
         train_data=train_data,
-        eval_data=valid_data,
-        output_dir='/kaggle/working/ckpt/enhanced_genks',
-        epochs=5,
-        batch_size=8,
-        accumulation_steps=4,
-        learning_rate=2e-5,
-        warmup_steps=1000
+        valid_data=valid_data,
+        output_dir=os.path.join(config['output_dir'], 'checkpoints'),
+        epochs=config['epochs'],
+        batch_size=config['batch_size'],
+        learning_rate=config['learning_rate'],
+        gpu_monitor=gpu_monitor
     )
 
-    # Đánh giá mô hình trên tập test seen
-    results_seen = evaluate_enhanced_genks(
+    # Step 5: End-to-end evaluation
+    logger.info("\n📊 Step 5: Running end-to-end evaluation...")
+    eval_results = run_end_to_end_evaluation(
         model=model,
-        eval_data=test_seen_data,
-        output_file='/kaggle/working/ckpt/enhanced_genks/results_seen.json',
-        batch_size=16
+        eval_data=test_data,
+        output_dir=os.path.join(config['output_dir'], 'evaluation'),
+        num_samples=None,  # Evaluate on all samples
+        run_ablation=True,
+        verbose=False
     )
 
-    # Đánh giá mô hình trên tập test unseen
-    results_unseen = evaluate_enhanced_genks(
-        model=model,
-        eval_data=test_unseen_data,
-        output_file='/kaggle/working/ckpt/enhanced_genks/results_unseen.json',
-        batch_size=16
-    )
+    # Step 6: Demo with process_query
+    logger.info("\n🎭 Step 6: Demo - Processing sample queries...")
 
-    # Hiển thị kết quả cuối cùng
-    logger.info("\nKết quả trên tập test seen:")
-    for metric, value in results_seen.items():
-        logger.info(f"{metric}: {value:.2f}")
+    # # Demo 1: Simple query
+    # demo_result = model.process_query(
+    #     query="Tell me about machine learning",
+    #     dialogue_history=None,
+    #     verbose=True
+    # )
+    #
+    # # Demo 2: Query with context
+    # demo_result_2 = model.process_query(
+    #     query="What are the main types?",
+    #     dialogue_history=["Let's talk about artificial intelligence", "Sure! AI is a broad field."],
+    #     verbose=True
+    # )
 
-    logger.info("\nKết quả trên tập test unseen:")
-    for metric, value in results_unseen.items():
-        logger.info(f"{metric}: {value:.2f}")
+    # Step 7: Final summary
+    logger.info("\n" + "=" * 80)
+    logger.info("EXECUTION COMPLETE")
+    logger.info("=" * 80)
+
+    # Print summary statistics
+    if 'full_pipeline' in eval_results:
+        results = eval_results['full_pipeline']['aggregated']
+
+        logger.info("\n📈 Final Performance Summary:")
+        logger.info("-" * 40)
+
+        key_metrics = [
+            ('Retrieval Recall@10', results.get('retrieval', {}).get('recall@10', {}).get('mean', 0)),
+            ('Selection F1', results.get('selection', {}).get('selection_f1', {}).get('mean', 0)),
+            ('Generation F1', results.get('generation', {}).get('unigram_f1', {}).get('mean', 0)),
+            ('Knowledge F1', results.get('generation', {}).get('knowledge_f1', {}).get('mean', 0)),
+            ('Hallucination Rate', results.get('generation', {}).get('hallucination_rate', {}).get('mean', 0)),
+            ('Combined Score', results.get('end_to_end', {}).get('combined_score', {}).get('mean', 0))
+        ]
+
+        for metric_name, value in key_metrics:
+            if 'Rate' in metric_name:
+                logger.info(f"{metric_name:20s}: {value:.3f}")
+            else:
+                logger.info(f"{metric_name:20s}: {value * 100:.2f}%")
+
+    # GPU statistics
+    if gpu_monitor.gpu_available:
+        logger.info(f"\n💻 GPU Statistics:")
+        logger.info(f"Peak memory usage: {gpu_monitor.peak_memory:.2f} GB")
+
+    logger.info(f"\n✅ All results saved to: {config['output_dir']}")
+    logger.info("🎉 RA-GenKS system execution complete!")
 
 
 if __name__ == '__main__':
+    # Set random seeds for reproducibility
+    import random
+
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
+    # Run main pipeline
     main()
